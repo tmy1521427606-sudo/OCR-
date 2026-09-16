@@ -1,0 +1,34 @@
+# Local Python environment and interpreter artifacts
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local state, credentials, caches and logs
+.state/
+*.sqlite3
+*.log
+
+# Per-run OCR results and generated acceptance fixtures
+runs/
+mock-acceptance/
+mock-acceptance-final/
+mock-state/
+mock-state-final/
+paddle-acceptance-runs/
+paddle-acceptance-state/
+
+# Generated deliverables and archived copies
+*.zip
+result.csv
+result.xlsx
+report.html
+实时结果.html
+运行面板.html
+待复核图片.json
+performance.json
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
