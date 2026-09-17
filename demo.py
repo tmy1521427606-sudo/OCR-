@@ -718,6 +718,29 @@ def safe_message(value: Any) -> str:
     return re.sub(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", text)[:2000]
 
 
+def price_month_and_freshness(
+    source_time: Any, *, as_of: date | None = None
+) -> tuple[str | None, str]:
+    match = re.search(r"(?<!\d)(\d{4})-?(\d{2})(?!\d)", str(source_time or ""))
+    if not match:
+        return None, "未知（无价格月份）"
+    year, month = map(int, match.groups())
+    try:
+        date(year, month, 1)
+    except ValueError:
+        return None, "未知（价格月份无效）"
+    current = as_of or date.today()
+    age_months = current.year * 12 + current.month - (year * 12 + month)
+    month_text = f"{year:04d}-{month:02d}"
+    if age_months < 0:
+        return month_text, "异常（未来月份）"
+    if age_months == 0:
+        return month_text, "最新（本月）"
+    if age_months == 1:
+        return month_text, "较新（1个月前）"
+    return month_text, f"待关注（{age_months}个月前）"
+
+
 def identity_key(platform: str, product_id: str) -> str:
     return f"{platform}{PRODUCT_KEY_SEPARATOR}{product_id}"
 
@@ -2467,15 +2490,15 @@ def assemble_product(
     if db_price.get("status") != "ok" or positive_decimal(db_price.get("value")) is None:
         if not any(item["code"].startswith("PRICE_") for item in problems):
             problems.append(issue("PRICE_NOT_FOUND", "没有可用数据库价格"))
-    price_month = re.match(r"(\d{4})-?(\d{2})", str(db_price.get("source_time") or ""))
+    price_month, price_freshness = price_month_and_freshness(db_price.get("source_time"))
     if price_month and str(db_price.get("source_table") or "").startswith("mv_com_goods_statistics_monthly"):
-        year, month = map(int, price_month.groups())
+        year, month = map(int, price_month.split("-"))
         age_months = date.today().year * 12 + date.today().month - (year * 12 + month)
         if age_months > 3:
             problems.append(
                 issue(
                     "PRICE_STALE",
-                    f"月度价格来源 {price_month.group(0)} 距当前已 {age_months} 个月，请人工确认",
+                    f"月度价格来源 {price_month} 距当前已 {age_months} 个月，请人工确认",
                     "warning",
                 )
             )
@@ -2602,6 +2625,8 @@ def assemble_product(
         "适用人群": first_non_empty(model.get("applicable_crowd"), model.get("renqun")),
         "商品主数据来源": db_record.get("platform_source", {}).get("label"),
         "价格数据来源": db_price.get("platform_source", {}).get("label"),
+        "价格月份": price_month,
+        "价格新鲜度": price_freshness,
         "所有SKU": "、".join(sku_values) if sku_values else None,
         "SKU数量": len(sku_values) if sku_values else None,
         "上架时间": product.get("first_shelf_time"),
@@ -2620,6 +2645,8 @@ def assemble_product(
         "platform": product["platform"],
         "商品主数据来源": available["商品主数据来源"],
         "价格数据来源": available["价格数据来源"],
+        "价格月份": available["价格月份"],
+        "价格新鲜度": available["价格新鲜度"],
     }
     for column in template["output_columns"]:
         name = column["name"]
@@ -2741,6 +2768,8 @@ def workbook_columns(template: dict[str, Any]) -> list[dict[str, Any]]:
         {"key": "platform", "header": "platform", "type": "text", "width": 12},
         {"key": "商品主数据来源", "header": "商品主数据来源", "type": "text", "width": 28},
         {"key": "价格数据来源", "header": "价格数据来源", "type": "text", "width": 28},
+        {"key": "价格月份", "header": "价格月份", "type": "text", "width": 12},
+        {"key": "价格新鲜度", "header": "价格新鲜度", "type": "text", "width": 20},
     ]
     for item in template["output_columns"]:
         field_type = type_map[item["type"]]

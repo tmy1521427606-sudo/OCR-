@@ -1014,7 +1014,12 @@ def _assemble_result(
     if first.get("product_name") is None:
         issues.append(_issue("NAME_NOT_FOUND", "三个名称来源均无有效商品名"))
     if not attributes:
-        issues.append(_issue("ATTRIBUTES_NOT_FOUND", "主属性和整组备用属性均为空"))
+        issues.append(
+            _issue(
+                "ATTRIBUTES_NOT_FOUND",
+                "数据库无属性，不代表 OCR 识别失败；主属性表和备用属性表均未返回记录",
+            )
+        )
 
     result = {
         "identity": {

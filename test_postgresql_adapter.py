@@ -1,11 +1,12 @@
 import importlib.util
 import unittest
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 from psycopg import sql
 
-from demo import postgres_connection_info, workbook_columns
+from demo import price_month_and_freshness, postgres_connection_info, workbook_columns
 from redshift_backend import (
     ATTRIBUTE_QUERY_TIMEOUT_MS,
     MONTHLY_QUERY_TIMEOUT_MS,
@@ -272,7 +273,42 @@ class PostgreSQLSchemaTests(unittest.TestCase):
 
         self.assertEqual(
             [column["key"] for column in columns],
-            ["platform", "商品主数据来源", "价格数据来源"],
+            [
+                "platform",
+                "商品主数据来源",
+                "价格数据来源",
+                "价格月份",
+                "价格新鲜度",
+            ],
+        )
+
+    def test_price_month_and_freshness_expose_stale_months(self):
+        self.assertEqual(
+            price_month_and_freshness(202607, as_of=date(2026, 9, 17)),
+            ("2026-07", "待关注（2个月前）"),
+        )
+        self.assertEqual(
+            price_month_and_freshness("202608", as_of=date(2026, 9, 17)),
+            ("2026-08", "较新（1个月前）"),
+        )
+
+    def test_empty_attributes_explain_that_ocr_is_not_the_failure(self):
+        result = resolve_mock_rows(
+            [{"platform": "jd", "product_id": "no-attributes"}],
+            goods_rows=[{
+                "platform_goods_id": "no-attributes",
+                "platform_goods_key": 1,
+                "platform_goods_name": "商品",
+                "last_upd_dt": "2026-09-14",
+                "current_price": "99",
+                "original_price": "119",
+            }],
+        )
+
+        issues = result["jd\x1fno-attributes"]["review_issues"]
+        self.assertIn(
+            "数据库无属性，不代表 OCR 识别失败",
+            next(item["message"] for item in issues if item["code"] == "ATTRIBUTES_NOT_FOUND"),
         )
 
 
