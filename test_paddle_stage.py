@@ -29,7 +29,7 @@ class PaddleStageTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "PADDLE_OCR_REVIEW")
 
-    def test_unreachable_paddle_is_marked_once_without_sending_batches(self) -> None:
+    def test_unreachable_paddle_keeps_the_run_for_manual_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             image = base / "01.jpg"
@@ -44,20 +44,66 @@ class PaddleStageTests(unittest.TestCase):
                     demo, "verify_paddle_available",
                     side_effect=demo.PaddleOcrError("Paddle OCR unavailable: timed out"),
                 ), patch.object(demo, "post_batch") as post:
-                    output = demo.run_paddle_ocr_stage(
-                        "run-1",
-                        manifest,
-                        {"paddle_ocr_api_url": "http://127.0.0.1:8870/v1/ocr", "paddle_workers": 1},
-                        store,
-                        demo.ConcurrencyMeter(),
-                    )
+                    with self.assertRaisesRegex(demo.DemoError, "PADDLE_OCR_INTERRUPTED"):
+                        demo.run_paddle_ocr_stage(
+                            "run-1",
+                            manifest,
+                            {
+                                "paddle_ocr_api_url": "http://127.0.0.1:8870/v1/ocr",
+                                "paddle_workers": 1,
+                                "paddle_recovery_attempts": 1,
+                            },
+                            store,
+                            demo.ConcurrencyMeter(),
+                        )
+                    events = store.events("run-1")
             finally:
                 store.close()
 
-        item = output[demo.identity_key("jd", "p1")][0]
-        self.assertFalse(item["ok"])
-        self.assertEqual(item["error"]["code"], "PADDLE_OCR_UNREACHABLE")
         post.assert_not_called()
+        self.assertTrue(any(item["status"] == "interrupted" for item in events))
+
+    def test_paddle_recovers_and_retries_the_current_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            image = base / "01.jpg"
+            image.write_bytes(b"image")
+            store = demo.StateStore(base / "state")
+            manifest = {"products": [{
+                "platform": "jd", "product_id": "p1",
+                "images": [{"name": "01.jpg", "path": str(image), "sha256": "one"}],
+            }]}
+            try:
+                with patch.object(
+                    demo,
+                    "verify_paddle_available",
+                    side_effect=[demo.PaddleOcrError("Paddle OCR unavailable: timed out"), None],
+                ), patch.object(
+                    demo,
+                    "post_batch",
+                    side_effect=lambda _url, images, timeout: [{"id": images[0].request_id, "text": "识别成功"}],
+                ), patch.object(demo.time, "sleep"):
+                    output = demo.run_paddle_ocr_stage(
+                        "run-1",
+                        manifest,
+                        {
+                            "paddle_ocr_api_url": "http://127.0.0.1:8870/v1/ocr",
+                            "paddle_workers": 1,
+                            "paddle_recovery_attempts": 2,
+                            "paddle_recovery_delay_seconds": 0,
+                        },
+                        store,
+                        demo.ConcurrencyMeter(),
+                    )
+                    events = store.events("run-1")
+            finally:
+                store.close()
+
+        self.assertTrue(output[demo.identity_key("jd", "p1")][0]["ok"])
+        self.assertEqual(
+            [item["status"] for item in events if item["stage"] == "ocr_service"],
+            ["interrupted", "recovered"],
+        )
 
 
 if __name__ == "__main__":
