@@ -1,5 +1,6 @@
 import importlib.util
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 from psycopg import sql
@@ -177,6 +178,86 @@ class PostgreSQLSchemaTests(unittest.TestCase):
         self.assertEqual(attributes["品牌"]["source_table"], "d_platform_goods_attributes")
         self.assertEqual(attributes["剂型"]["value"], "片剂")
         self.assertEqual(attributes["剂型"]["source_table"], "new_infinitus_attribute")
+
+    def test_jd_uses_the_matching_main_key_from_jd_worldwide_monthly_rows(self):
+        result = resolve_mock_rows(
+            [{"platform": "jd", "product_id": "2112893"}],
+            goods_rows=[{
+                "platform_goods_id": "2112893",
+                "platform_key": 1,
+                "platform_goods_key": 6286313,
+                "platform_goods_name": "Swisse鱼油",
+                "last_upd_dt": "2026-09-04",
+                "current_price": None,
+                "original_price": None,
+            }],
+            monthly_rows=[{
+                "platform_goods_id": "2112893",
+                "platform_key": 16,
+                "platform_goods_key": 6286313,
+                "platform_goods_name": "Swisse鱼油",
+                "month": 202608,
+                "lowest_promo_price": "189",
+                "avg_promo_price": None,
+                "avg_price_m": None,
+                "rrp": None,
+            }, {
+                "platform_goods_id": "2112893",
+                "platform_key": 16,
+                "platform_goods_key": 5002081679,
+                "platform_goods_name": "Swisse鱼油其他链接",
+                "month": 202608,
+                "lowest_promo_price": "237",
+                "avg_promo_price": None,
+                "avg_price_m": None,
+                "rrp": None,
+            }],
+        )
+
+        document = result["jd\x1f2112893"]
+        self.assertEqual(document["key"]["value"], 6286313)
+        self.assertEqual(document["price"]["value"], Decimal("189"))
+        self.assertEqual(document["price"]["status"], "ok")
+
+    def test_jd_uses_the_latest_price_for_the_matching_main_key(self):
+        result = resolve_mock_rows(
+            [{"platform": "jd", "product_id": "2018571"}],
+            goods_rows=[{
+                "platform_goods_id": "2018571",
+                "platform_key": 1,
+                "platform_goods_key": 5738870,
+                "platform_goods_name": "雀巢蔼儿舒",
+                "last_upd_dt": "2026-08-09",
+                "current_price": None,
+                "original_price": None,
+            }],
+            monthly_rows=[{
+                "platform_goods_id": "2018571",
+                "platform_key": 1,
+                "platform_goods_key": 5002080498,
+                "platform_goods_name": "雀巢蔼儿舒新链接",
+                "month": 202608,
+                "lowest_promo_price": "321.1",
+                "avg_promo_price": None,
+                "avg_price_m": None,
+                "rrp": None,
+            }, {
+                "platform_goods_id": "2018571",
+                "platform_key": 1,
+                "platform_goods_key": 5738870,
+                "platform_goods_name": "雀巢蔼儿舒",
+                "month": 202607,
+                "lowest_promo_price": "311.1",
+                "avg_promo_price": None,
+                "avg_price_m": None,
+                "rrp": None,
+            }],
+        )
+
+        document = result["jd\x1f2018571"]
+        self.assertEqual(document["key"]["value"], 5738870)
+        self.assertEqual(document["price"]["value"], Decimal("311.1"))
+        self.assertEqual(document["price"]["status"], "ok")
 
 
 if __name__ == "__main__":

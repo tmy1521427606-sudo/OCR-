@@ -57,12 +57,19 @@ REQUIRED_COLUMNS = {
 }
 
 PLATFORM_COLUMN_CANDIDATES = (
+    "platform_key",
     "platform",
     "platform_code",
     "platform_id",
     "platform_name",
     "platform_type",
 )
+
+PLATFORM_SCOPE_VALUES = {
+    "jd": {
+        "platform_key": ("1", "16"),
+    },
+}
 
 
 class RedshiftEnrichmentError(RuntimeError):
@@ -1088,6 +1095,9 @@ def enrich_products(
                 for name in sorted(REQUIRED_COLUMNS[logical_name])
                 if name in relations[logical_name]["columns"]
             )
+            platform_column = _platform_column(relations[logical_name])
+            if platform_column:
+                columns = tuple(sorted({*columns, platform_column}))
             query = _build_lookup_query(
                 sql, relations[logical_name], columns, filter_column
             )
@@ -1162,6 +1172,11 @@ def _mock_platform_column(rows: Sequence[dict[str, Any]]) -> str | None:
     return matches[0] if matches else None
 
 
+def _platform_scope_values(platform: str, column: str) -> tuple[str, ...] | None:
+    platform_scope = PLATFORM_SCOPE_VALUES.get(platform.casefold().strip(), {})
+    return platform_scope.get(column.casefold())
+
+
 def _mock_scope(
     rows: Sequence[dict[str, Any]],
     id_column: str,
@@ -1172,12 +1187,20 @@ def _mock_scope(
     platform_column = _mock_platform_column(rows)
     if not platform_column:
         return candidates, False
-    platform_norm = platform.casefold().strip()
-    return [
+    scope_values = _platform_scope_values(platform, platform_column)
+    if scope_values is None:
+        return candidates, False
+    scoped = [
         row
         for row in candidates
-        if str(row.get(platform_column, "")).casefold().strip() == platform_norm
-    ], True
+        if str(row.get(platform_column, "")).casefold().strip() in scope_values
+    ]
+    primary = [
+        row
+        for row in scoped
+        if str(row.get(platform_column, "")).casefold().strip() == scope_values[0]
+    ]
+    return primary or scoped, True
 
 
 def _time_key(value: Any) -> tuple[int, str]:
@@ -1435,8 +1458,15 @@ def resolve_mock_rows(
         else:
             product_name = name_source = name_time = None
 
+        monthly_price_rows = monthly
+        if key_status == "ok":
+            monthly_price_rows = [
+                row
+                for row in monthly
+                if str(row.get("platform_goods_key")) == str(resolved_key)
+            ]
         monthly_price = _mock_price(
-            monthly,
+            monthly_price_rows,
             "month",
             ("lowest_promo_price", "avg_promo_price", "avg_price_m", "rrp"),
         )
