@@ -40,6 +40,38 @@ class FrontendAndSpeedTests(unittest.TestCase):
             "--open", "--bulk-first-pass", "--new-run", "--force-ocr",
         ])
 
+    def test_ocr_service_test_reports_current_endpoint_when_reachable(self) -> None:
+        called: list[tuple[str, float]] = []
+
+        def reachable(url: str, timeout: float) -> None:
+            called.append((url, timeout))
+
+        result = frontend.test_ocr_service_url(
+            "http://192.168.1.115:8870/v1/ocr", verifier=reachable
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["url"], "http://192.168.1.115:8870/v1/ocr")
+        self.assertIn("192.168.1.115:8870", result["message"])
+        self.assertEqual(called, [("http://192.168.1.115:8870/v1/ocr", 3.0)])
+
+    def test_ocr_service_test_failure_does_not_validate_changed_address(self) -> None:
+        def unreachable(_url: str, _timeout: float) -> None:
+            raise RuntimeError("timed out")
+
+        result = frontend.test_ocr_service_url(
+            "http://192.168.1.115:8870/v1/ocr", verifier=unreachable
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("timed out", result["message"])
+        self.assertFalse(frontend.is_current_ocr_service_verified(
+            "http://192.168.1.115:8870/v1/ocr", None
+        ))
+        self.assertFalse(frontend.is_current_ocr_service_verified(
+            "http://192.168.1.115:8871/v1/ocr", result
+        ))
+
     def test_force_ocr_bypasses_an_existing_ocr_cache_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

@@ -15,6 +15,7 @@ import time
 import urllib.parse
 from ctypes import wintypes
 from pathlib import Path
+from typing import Any, Callable
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -38,6 +39,28 @@ SAVED_NAMES = {
     "ocr_workers",
 }
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
+
+
+def test_ocr_service_url(
+    api_url: str,
+    *,
+    verifier: Callable[[str, float], None] | None = None,
+) -> dict[str, Any]:
+    """Check the configured OCR endpoint without sending an image."""
+    import paddle_ocr
+
+    url = api_url.strip()
+    check = verifier or paddle_ocr.verify_paddle_available
+    try:
+        check(url, 3.0)
+    except Exception as exc:
+        return {"ok": False, "url": url, "message": str(exc)}
+    endpoint = urllib.parse.urlparse(url).netloc or url
+    return {"ok": True, "url": url, "message": f"OCR 服务可达：{endpoint}"}
+
+
+def is_current_ocr_service_verified(api_url: str, result: dict[str, Any] | None) -> bool:
+    return bool(result and result.get("ok") and result.get("url") == api_url.strip())
 
 
 class DataBlob(ctypes.Structure):
@@ -364,6 +387,8 @@ def run_gui() -> None:
             self.log_popup: tk.Text | None = None
             self.running = False
             self.run_started = 0.0
+            self.ocr_service_test: dict[str, Any] | None = None
+            self.ocr_test_running = False
             self.output_dir: Path | None = None
             self.live_report: Path | None = None
             self.final_report: Path | None = None
@@ -372,6 +397,7 @@ def run_gui() -> None:
                 self.scan_products()
             for name in self.vars:
                 self.vars[name].trace_add("write", self.schedule_autosave)
+            self.vars["paddle_ocr_api_url"].trace_add("write", self.invalidate_ocr_service_test)
             self.rotated.trace_add("write", self.schedule_autosave)
             self.bulk_first_pass.trace_add("write", self.schedule_autosave)
             self.force_new.trace_add("write", self.schedule_autosave)
@@ -418,6 +444,11 @@ def run_gui() -> None:
             for row, (name, label) in enumerate(fields):
                 ttk.Label(conn, text=label).grid(row=row, column=0, sticky="w", pady=2)
                 ttk.Entry(conn, textvariable=self.vars[name]).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
+            self.ocr_test_button = ttk.Button(conn, text="测试 OCR 服务", command=self.test_ocr_service)
+            self.ocr_test_button.grid(row=len(fields), column=0, sticky="w", pady=(7, 0))
+            self.ocr_test_status = tk.StringVar(value="运行前请测试 OCR 服务")
+            self.ocr_test_label = tk.Label(conn, textvariable=self.ocr_test_status, anchor="w", fg="#895b00")
+            self.ocr_test_label.grid(row=len(fields), column=1, sticky="w", padx=(8, 0), pady=(7, 0))
             conn.columnconfigure(1, weight=1)
 
             secret = ttk.LabelFrame(outer, text="3. 凭据（Windows 加密保存，输入框隐藏）", padding=8)
@@ -491,6 +522,27 @@ def run_gui() -> None:
         def values(self) -> dict[str, str]:
             return {name: variable.get() for name, variable in self.vars.items()}
 
+        def invalidate_ocr_service_test(self, *_: object) -> None:
+            if self.ocr_service_test is not None:
+                self.ocr_service_test = None
+                self.ocr_test_status.set("OCR 地址已变更，请重新测试")
+                self.ocr_test_label.configure(fg="#895b00")
+
+        def test_ocr_service(self) -> None:
+            if self.ocr_test_running:
+                return
+            self.ocr_service_test = None
+            self.ocr_test_running = True
+            self.ocr_test_button.configure(state="disabled")
+            self.ocr_test_status.set("正在测试 OCR 服务…")
+            self.ocr_test_label.configure(fg="#1f4e78")
+            url = self.vars["paddle_ocr_api_url"].get()
+
+            def worker() -> None:
+                self.events.put(("ocr_service_test", test_ocr_service_url(url)))
+
+            threading.Thread(target=worker, daemon=True).start()
+
         def choose_root(self) -> None:
             chosen = filedialog.askdirectory(title="选择包含 product_id 子目录的批次目录")
             if chosen:
@@ -560,6 +612,14 @@ def run_gui() -> None:
         def start(self) -> None:
             values = self.values()
             selected = self.selected_names()
+            if not is_current_ocr_service_verified(
+                values["paddle_ocr_api_url"], self.ocr_service_test
+            ):
+                messagebox.showwarning(
+                    "请先测试 OCR 服务",
+                    "请先点击“测试 OCR 服务”。服务可达后才会启动正式任务，避免整批图片被标记待复核。",
+                )
+                return
             try:
                 warning = validate(values, selected, self.rotated.get())
             except ValueError as exc:
@@ -638,6 +698,23 @@ def run_gui() -> None:
                     kind, value = self.events.get_nowait()
                     if kind == "log":
                         self.append_log(str(value))
+                    elif kind == "ocr_service_test":
+                        result = dict(value)  # type: ignore[arg-type]
+                        self.ocr_test_running = False
+                        self.ocr_test_button.configure(state="normal")
+                        if is_current_ocr_service_verified(
+                            self.vars["paddle_ocr_api_url"].get(), result
+                        ):
+                            self.ocr_service_test = result
+                            self.ocr_test_status.set(str(result["message"]))
+                            self.ocr_test_label.configure(fg="#176b3a")
+                        else:
+                            self.ocr_service_test = None
+                            message = str(result.get("message") or "OCR 服务不可达")
+                            self.ocr_test_status.set(
+                                f"OCR 服务不可达：{message}；检查 VPN、路由或服务状态"
+                            )
+                            self.ocr_test_label.configure(fg="#9d2020")
                     elif kind == "done":
                         code = int(value)
                         self.running = False
