@@ -476,7 +476,7 @@ def run_gui() -> None:
             ).grid(row=0, column=0, columnspan=3, sticky="w")
             ttk.Checkbutton(
                 mode,
-                text="强制创建新运行（不恢复未完成运行）",
+                text="强制创建新运行（不恢复未完成或服务中断的运行）",
                 variable=self.force_new,
             ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
             ttk.Checkbutton(
@@ -495,6 +495,11 @@ def run_gui() -> None:
             ttk.Label(mode, text="Paddle 每批最多 8 图；并行只提高整体吞吐").grid(
                 row=3, column=2, sticky="w", pady=(6, 0)
             )
+            ttk.Label(
+                mode,
+                text="服务中断会自动等待恢复约5分钟；超时后重新测试服务，再点重新运行即可继续未完成图片。",
+                foreground="#895b00",
+            ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
             actions = ttk.Frame(outer)
             actions.pack(fill="x", pady=8)

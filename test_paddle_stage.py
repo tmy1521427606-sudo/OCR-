@@ -44,7 +44,7 @@ class PaddleStageTests(unittest.TestCase):
                     demo, "verify_paddle_available",
                     side_effect=demo.PaddleOcrError("Paddle OCR unavailable: timed out"),
                 ), patch.object(demo, "post_batch") as post:
-                    with self.assertRaisesRegex(demo.DemoError, "PADDLE_OCR_INTERRUPTED"):
+                    with self.assertRaises(demo.DemoError) as caught:
                         demo.run_paddle_ocr_stage(
                             "run-1",
                             manifest,
@@ -61,6 +61,7 @@ class PaddleStageTests(unittest.TestCase):
                 store.close()
 
         post.assert_not_called()
+        self.assertEqual(caught.exception.code, "PADDLE_OCR_INTERRUPTED")
         self.assertTrue(any(item["status"] == "interrupted" for item in events))
 
     def test_paddle_recovers_and_retries_the_current_batch(self) -> None:
@@ -91,11 +92,13 @@ class PaddleStageTests(unittest.TestCase):
                             "paddle_workers": 1,
                             "paddle_recovery_attempts": 2,
                             "paddle_recovery_delay_seconds": 0,
+                            "run_output_dir": str(base / "output"),
                         },
                         store,
                         demo.ConcurrencyMeter(),
                     )
                     events = store.events("run-1")
+                    record_count = len(list((base / "output").glob("ocr服务中断-*.json")))
             finally:
                 store.close()
 
@@ -104,6 +107,7 @@ class PaddleStageTests(unittest.TestCase):
             [item["status"] for item in events if item["stage"] == "ocr_service"],
             ["interrupted", "recovered"],
         )
+        self.assertEqual(record_count, 1)
 
 
 if __name__ == "__main__":

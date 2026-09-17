@@ -56,6 +56,8 @@ PADDLE_OCR_PROMPT_VERSION = "paddle-ocr-payload-v1"
 PADDLE_BATCH_SIZE = 8
 PADDLE_DEFAULT_API_URL = "http://192.168.1.115:8870/v1/ocr"
 PADDLE_DEFAULT_MODEL_VERSION = "PaddleOCR-VL-1.6"
+PADDLE_RECOVERY_ATTEMPTS = 30
+PADDLE_RECOVERY_DELAY_SECONDS = 10
 QWEN_RETRY_DELAYS = (2.0, 5.0, 10.0, 20.0)
 RETENTION_DAYS = 90
 QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -1277,6 +1279,113 @@ def paddle_worker_count(config: dict[str, Any]) -> int:
     return workers
 
 
+def is_paddle_service_interruption(error: PaddleOcrError) -> bool:
+    message = safe_message(error).casefold()
+    return "paddle ocr unavailable:" in message or any(
+        f"paddle ocr http {status}" in message for status in (500, 502, 503, 504)
+    )
+
+
+def write_paddle_interruption_record(
+    run_id: str,
+    config: dict[str, Any],
+    reason: str,
+    attempts: int,
+    delay_seconds: float,
+) -> str | None:
+    output_text = str(config.get("run_output_dir") or "").strip()
+    if not output_text:
+        return None
+    try:
+        output_dir = Path(output_text)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        target = output_dir / f"ocr服务中断-{utc_now().strftime('%Y%m%d-%H%M%S-%f')}.json"
+        dump_json(
+            target,
+            {
+                "run_id": run_id,
+                "detected_at": iso_now(),
+                "reason": reason,
+                "automatic_recovery_attempts": attempts,
+                "automatic_recovery_delay_seconds": delay_seconds,
+                "manual_resume": "服务恢复后重新测试 OCR 服务，再点击重新运行；不要勾选强制创建新运行。",
+            },
+        )
+        return str(target)
+    except OSError:
+        return None
+
+
+def wait_for_paddle_recovery(
+    run_id: str,
+    config: dict[str, Any],
+    store: StateStore,
+    error: PaddleOcrError,
+) -> bool:
+    try:
+        attempts = int(config.get("paddle_recovery_attempts", PADDLE_RECOVERY_ATTEMPTS))
+        delay_seconds = float(
+            config.get("paddle_recovery_delay_seconds", PADDLE_RECOVERY_DELAY_SECONDS)
+        )
+    except (TypeError, ValueError) as exc:
+        raise DemoError("INVALID_PADDLE_RECOVERY", "Paddle 服务恢复参数无效") from exc
+    if attempts < 1 or attempts > 60 or delay_seconds < 0 or delay_seconds > 60:
+        raise DemoError("INVALID_PADDLE_RECOVERY", "Paddle 服务恢复参数超出允许范围")
+
+    reason = safe_message(error)
+    record_ref = write_paddle_interruption_record(
+        run_id, config, reason, attempts, delay_seconds
+    )
+    store.event(
+        run_id,
+        "ocr_service",
+        "interrupted",
+        severity="error",
+        error_code="PADDLE_OCR_INTERRUPTED",
+        message=f"Paddle OCR 服务中断：{reason}",
+        attempts=attempts,
+        artifact_ref=record_ref,
+    )
+    progress(
+        f"Paddle OCR 服务中断：{reason}；自动等待恢复（最多约 "
+        f"{round((attempts - 1) * delay_seconds / 60, 1)} 分钟），成功图片已保存"
+    )
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            time.sleep(delay_seconds)
+        try:
+            verify_paddle_available(str(config["paddle_ocr_api_url"]))
+        except PaddleOcrError:
+            continue
+        store.event(
+            run_id,
+            "ocr_service",
+            "recovered",
+            message=f"Paddle OCR 服务已恢复，第 {attempt} 次探测成功",
+            attempts=attempt,
+        )
+        progress(f"Paddle OCR 服务已恢复，第 {attempt} 次探测成功；继续未完成图片")
+        return True
+    store.event(
+        run_id,
+        "ocr_service",
+        "manual_resume_required",
+        severity="error",
+        error_code="PADDLE_OCR_INTERRUPTED",
+        message="Paddle OCR 服务在自动恢复窗口内未恢复；本次运行已保留，需手动恢复",
+        attempts=attempts,
+    )
+    return False
+
+
+def raise_paddle_manual_resume_required() -> None:
+    raise DemoError(
+        "PADDLE_OCR_INTERRUPTED",
+        "Paddle OCR 服务未在自动恢复窗口内恢复；成功图片已保存。服务恢复后，"
+        "重新测试 OCR 服务，再点击“重新运行”（不要勾选强制创建新运行）即可继续。",
+    )
+
+
 def run_paddle_ocr_stage(
     run_id: str,
     manifest: dict[str, Any],
@@ -1303,31 +1412,34 @@ def run_paddle_ocr_stage(
     batches = [pending[index:index + PADDLE_BATCH_SIZE] for index in range(0, len(pending), PADDLE_BATCH_SIZE)]
     total = sum(len(product["images"]) for product in manifest["products"])
     progress(f"Paddle OCR 阶段开始：共 {total} 张图片，批次 {len(batches)}，并行 {paddle_worker_count(config)}")
-    service_error: str | None = None
     if pending:
         try:
             verify_paddle_available(str(config["paddle_ocr_api_url"]))
         except PaddleOcrError as exc:
-            service_error = safe_message(exc)
-            progress("Paddle OCR 服务不可达：未发送图片，已快速标记待复核；请检查 VPN 路由或服务端口")
+            if not wait_for_paddle_recovery(run_id, config, store, exc):
+                raise_paddle_manual_resume_required()
 
     def run_batch(batch: list[PaddleImage]) -> tuple[list[PaddleImage], list[dict[str, Any]], int, int, str | None]:
-        if service_error:
-            return batch, [], 0, 0, service_error
         started = time.perf_counter()
         error: str | None = None
         results: list[dict[str, Any]] = []
         attempts = 0
-        for attempts in (1, 2):
-            try:
-                increment_metric(config, "ocr_api_calls")
-                with meter:
-                    results = post_batch(str(config["paddle_ocr_api_url"]), batch, timeout=30)
-                error = None
-                break
-            except PaddleOcrError as exc:
-                error = safe_message(exc)
-        return batch, results, round((time.perf_counter() - started) * 1000), attempts, error
+        while True:
+            last_error: PaddleOcrError | None = None
+            for _ in range(2):
+                attempts += 1
+                try:
+                    increment_metric(config, "ocr_api_calls")
+                    with meter:
+                        results = post_batch(str(config["paddle_ocr_api_url"]), batch, timeout=30)
+                    return batch, results, round((time.perf_counter() - started) * 1000), attempts, None
+                except PaddleOcrError as exc:
+                    last_error = exc
+                    error = safe_message(exc)
+            if last_error is None or not is_paddle_service_interruption(last_error):
+                return batch, results, round((time.perf_counter() - started) * 1000), attempts, error
+            if not wait_for_paddle_recovery(run_id, config, store, last_error):
+                raise_paddle_manual_resume_required()
 
     completed = sum(len(items) for items in output.values())
     with futures.ThreadPoolExecutor(max_workers=paddle_worker_count(config), thread_name_prefix="paddle") as executor:
@@ -1339,7 +1451,7 @@ def run_paddle_ocr_stage(
                 if error:
                     item = paddle_result_to_ocr_result(image, {}, duration_ms=duration_ms, attempts=attempts)
                     item["error"] = {
-                        "code": "PADDLE_OCR_UNREACHABLE" if service_error else "PADDLE_OCR_REVIEW",
+                        "code": "PADDLE_OCR_REVIEW",
                         "message": error,
                     }
                 else:
@@ -3232,6 +3344,7 @@ def execute_pipeline(
         attempt_id = store.begin_attempt()
         products_dir = output_dir / "products"
         products_dir.mkdir(parents=True, exist_ok=True)
+        config["run_output_dir"] = str(output_dir)
         if resumed:
             print(f"恢复未完成运行: {run_id}")
         if not config.get("mock") and config.get("ocr_provider", "vllm-qwen-vl") == "vllm-qwen-vl":
@@ -3432,7 +3545,10 @@ def execute_pipeline(
         }
     except DemoError as exc:
         if run_id and exc.code != "SIMULATED_INTERRUPT":
-            store.finish_run(run_id, "failed")
+            store.finish_run(
+                run_id,
+                "interrupted" if exc.code == "PADDLE_OCR_INTERRUPTED" else "failed",
+            )
             peaks = {
                 "ocr": ocr_meter.peak,
                 "ocr_limit": ocr_worker_count(config),
