@@ -5,7 +5,7 @@ from pathlib import Path
 
 from psycopg import sql
 
-from demo import postgres_connection_info
+from demo import postgres_connection_info, workbook_columns
 from redshift_backend import (
     ATTRIBUTE_QUERY_TIMEOUT_MS,
     MONTHLY_QUERY_TIMEOUT_MS,
@@ -218,6 +218,14 @@ class PostgreSQLSchemaTests(unittest.TestCase):
         self.assertEqual(document["key"]["value"], 6286313)
         self.assertEqual(document["price"]["value"], Decimal("189"))
         self.assertEqual(document["price"]["status"], "ok")
+        self.assertEqual(
+            document["platform_source"]["label"],
+            "京东（主平台，platform_key=1）",
+        )
+        self.assertEqual(
+            document["price"]["platform_source"]["label"],
+            "京东全球购（补充平台，platform_key=16）",
+        )
 
     def test_jd_uses_the_latest_price_for_the_matching_main_key(self):
         result = resolve_mock_rows(
@@ -258,6 +266,14 @@ class PostgreSQLSchemaTests(unittest.TestCase):
         self.assertEqual(document["key"]["value"], 5738870)
         self.assertEqual(document["price"]["value"], Decimal("311.1"))
         self.assertEqual(document["price"]["status"], "ok")
+
+    def test_result_columns_expose_database_platform_sources(self):
+        columns = workbook_columns({"output_columns": []})
+
+        self.assertEqual(
+            [column["key"] for column in columns],
+            ["platform", "商品主数据来源", "价格数据来源"],
+        )
 
 
 if __name__ == "__main__":

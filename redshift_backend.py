@@ -71,6 +71,13 @@ PLATFORM_SCOPE_VALUES = {
     },
 }
 
+PLATFORM_SOURCE_LABELS = {
+    "jd": {
+        "1": "京东（主平台，platform_key=1）",
+        "16": "京东全球购（补充平台，platform_key=16）",
+    },
+}
+
 
 class RedshiftEnrichmentError(RuntimeError):
     pass
@@ -1034,6 +1041,10 @@ def _assemble_result(
             "source_table": first.get("name_source"),
             "source_time": _json_value(first.get("name_source_time")),
         },
+        "platform_source": {
+            "key": first.get("source_platform_key"),
+            "label": first.get("source_platform_label"),
+        },
         "attributes": attributes,
         "price": {
             "value": _decimal(first.get("price")),
@@ -1042,6 +1053,10 @@ def _assemble_result(
             "source_table": first.get("price_source_table"),
             "source_column": first.get("price_source_column"),
             "source_time": _json_value(first.get("price_source_time")),
+            "platform_source": {
+                "key": first.get("price_platform_key"),
+                "label": first.get("price_platform_label"),
+            },
             "monthly_variant_count": int(
                 first.get("monthly_price_variant_count") or 0
             ),
@@ -1173,8 +1188,30 @@ def _mock_platform_column(rows: Sequence[dict[str, Any]]) -> str | None:
 
 
 def _platform_scope_values(platform: str, column: str) -> tuple[str, ...] | None:
-    platform_scope = PLATFORM_SCOPE_VALUES.get(platform.casefold().strip(), {})
-    return platform_scope.get(column.casefold())
+    platform_norm = platform.casefold().strip()
+    platform_scope = PLATFORM_SCOPE_VALUES.get(platform_norm, {})
+    if column.casefold() == "platform_key":
+        return platform_scope.get("platform_key")
+    return (platform_norm,)
+
+
+def _platform_source_info(platform: str, platform_key: Any) -> dict[str, Any]:
+    key = "" if platform_key is None else str(platform_key).strip()
+    label = PLATFORM_SOURCE_LABELS.get(platform.casefold().strip(), {}).get(key)
+    if label is None:
+        label = f"未映射平台（platform_key={key or '-'}）"
+    return {"key": platform_key, "label": label}
+
+
+def _source_platform_key(
+    rows: Sequence[dict[str, Any]], key: Any, time_column: str
+) -> Any:
+    matching = [
+        row for row in rows
+        if str(row.get("platform_goods_key")) == str(key)
+    ]
+    latest = _latest_rows(matching, time_column)
+    return latest[0].get("platform_key") if latest else None
 
 
 def _mock_scope(
@@ -1416,6 +1453,16 @@ def resolve_mock_rows(
         else:
             resolved_key, key_status, key_source, key_time = None, "missing", None, None
 
+        if key_source == "d_platform_goods":
+            source_platform_key = _source_platform_key(
+                goods, resolved_key, "last_upd_dt"
+            )
+        elif key_source == "mv_com_goods_statistics_monthly_v2_internal_ssv4":
+            source_platform_key = _source_platform_key(monthly, resolved_key, "month")
+        else:
+            source_platform_key = None
+        source_platform = _platform_source_info(platform, source_platform_key)
+
         main_attributes = (
             _mock_main_attributes(attribute_rows, resolved_key)
             if key_status == "ok"
@@ -1488,6 +1535,18 @@ def resolve_mock_rows(
             price_status, price, price_column, price_time = goods_price[:4]
             price_source = "d_platform_goods" if price_status == "ok" else None
 
+        if price_source == "mv_com_goods_statistics_monthly_v2_internal_ssv4":
+            price_platform_key = _source_platform_key(
+                monthly_price_rows, resolved_key, "month"
+            )
+        elif price_source == "d_platform_goods":
+            price_platform_key = _source_platform_key(
+                goods, resolved_key, "last_upd_dt"
+            )
+        else:
+            price_platform_key = None
+        price_platform = _platform_source_info(platform, price_platform_key)
+
         flat = {
             "platform_status": platform_status,
             "candidate_row_count": len(goods) + len(monthly),
@@ -1496,6 +1555,8 @@ def resolve_mock_rows(
             "key_status": key_status,
             "key_source": key_source,
             "key_source_time": key_time,
+            "source_platform_key": source_platform["key"],
+            "source_platform_label": source_platform["label"],
             "goods_key": goods_key,
             "monthly_key": monthly_key,
             "goods_key_variant_count": goods_variants,
@@ -1509,6 +1570,8 @@ def resolve_mock_rows(
             "price_source_table": price_source,
             "price_source_column": price_column,
             "price_source_time": price_time,
+            "price_platform_key": price_platform["key"],
+            "price_platform_label": price_platform["label"],
             "monthly_price_variant_count": monthly_price[4],
             "goods_price_variant_count": goods_price[4],
             "snapshot_at": snapshot_at,

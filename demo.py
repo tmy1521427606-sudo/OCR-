@@ -1914,6 +1914,11 @@ def mock_database_results(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]
     for index, product in enumerate(manifest["products"]):
         key_value = 22129910 if product["product_id"] == "497394" else 30000000 + index
         price = Decimal("99.90") + Decimal(index)
+        source_label = (
+            "京东（主平台，platform_key=1）"
+            if product["platform"].casefold() == "jd"
+            else f"{product['platform']}（模拟平台）"
+        )
         record = {
             "identity": {
                 "platform": product["platform"],
@@ -1939,6 +1944,7 @@ def mock_database_results(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]
                 "source_table": "d_platform_goods",
                 "source_time": "2026-08-01T00:00:00+00:00",
             },
+            "platform_source": {"key": 1, "label": source_label},
             "attributes": [
                 {
                     "name": "品牌",
@@ -1960,6 +1966,7 @@ def mock_database_results(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]
                 "source_table": "mv_com_goods_statistics_monthly_v2_internal_ssv4",
                 "source_column": "lowest_promo_price",
                 "source_time": "2026-08-01T00:00:00+00:00",
+                "platform_source": {"key": 1, "label": source_label},
                 "monthly_variant_count": 1,
                 "goods_variant_count": 0,
             },
@@ -2593,6 +2600,8 @@ def assemble_product(
         "热门话题": enrichment["values"]["hot_topics"],
         "成分含量": model.get("ingredient_content"),
         "适用人群": first_non_empty(model.get("applicable_crowd"), model.get("renqun")),
+        "商品主数据来源": db_record.get("platform_source", {}).get("label"),
+        "价格数据来源": db_price.get("platform_source", {}).get("label"),
         "所有SKU": "、".join(sku_values) if sku_values else None,
         "SKU数量": len(sku_values) if sku_values else None,
         "上架时间": product.get("first_shelf_time"),
@@ -2607,7 +2616,11 @@ def assemble_product(
         "search": search,
         "input": product,
     }
-    row = {"platform": product["platform"]}
+    row = {
+        "platform": product["platform"],
+        "商品主数据来源": available["商品主数据来源"],
+        "价格数据来源": available["价格数据来源"],
+    }
     for column in template["output_columns"]:
         name = column["name"]
         row[name] = available[name] if name in available else resolve_extra_output(column, context)
@@ -2724,7 +2737,11 @@ def workbook_columns(template: dict[str, Any]) -> list[dict[str, Any]]:
         "datetime": "datetime",
         "array": "json",
     }
-    columns = [{"key": "platform", "header": "platform", "type": "text", "width": 12}]
+    columns = [
+        {"key": "platform", "header": "platform", "type": "text", "width": 12},
+        {"key": "商品主数据来源", "header": "商品主数据来源", "type": "text", "width": 28},
+        {"key": "价格数据来源", "header": "价格数据来源", "type": "text", "width": 28},
+    ]
     for item in template["output_columns"]:
         field_type = type_map[item["type"]]
         column: dict[str, Any] = {
@@ -3911,7 +3928,10 @@ def self_test() -> dict[str, Any]:
         if item["code"] == "SEARCH_EVIDENCE_MISSING"
     )["severity"] == "warning"
     assert warning_document["fields"]["代工厂"] is None
-    assert len(workbook_payload("warning-test", template, [warning_document], [])["result"]["rows"]) == 1
+    warning_payload = workbook_payload("warning-test", template, [warning_document], [])
+    assert len(warning_payload["result"]["rows"]) == 1
+    assert warning_payload["result"]["rows"][0]["商品主数据来源"] == "京东（主平台，platform_key=1）"
+    assert warning_payload["result"]["rows"][0]["价格数据来源"] == "京东（主平台，platform_key=1）"
 
     packaging_model = mock_qwen_values(template["model"]["fields"], False)
     packaging_model.update({"guige": "400g", "guige_zong_liang": 400})
