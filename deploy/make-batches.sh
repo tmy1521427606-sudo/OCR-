@@ -33,17 +33,22 @@
 # 注意：src 和 inbox 在同一个文件系统时，mv 只是改目录项，上万个目录也是秒级完成；
 #       跨文件系统（比如 staging 在 /，inbox 在 /data）会变成真实拷贝，很慢。
 #
+# 安全策略：先把所有目标批次名算出来，确认没有一个跟已有目录撞名，再开始搬。
+#           不会出现「搬到一半发现撞名、留下半个批次」的情况。
+#
 set -euo pipefail
 
 SRC=""
 INBOX="/data/ocr/inbox"
 SIZE=500
 PREFIX="batch"
+START=1
 DRY_RUN=0
 FORCE=0
+INCLUDE_NO_IMAGE=0
 
 usage() {
-    sed -n '3,40p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'
+    sed -n '3,42p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'
 }
 
 die() { echo "错误：$*" >&2; exit 2; }
@@ -54,15 +59,18 @@ while [[ $# -gt 0 ]]; do
         --inbox)   INBOX="${2:-}";   shift 2 ;;
         --size)    SIZE="${2:-}";    shift 2 ;;
         --prefix)  PREFIX="${2:-}";  shift 2 ;;
+        --start)   START="${2:-}";   shift 2 ;;
         --dry-run) DRY_RUN=1;        shift ;;
         --force)   FORCE=1;          shift ;;
+        --include-no-image) INCLUDE_NO_IMAGE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "未知参数：$1（用 --help 看用法）" ;;
     esac
 done
 
 [[ -n "$SRC" ]] || { usage; exit 2; }
-[[ "$SIZE" =~ ^[1-9][0-9]*$ ]] || die "--size 必须是正整数，当前是 '$SIZE'"
+[[ "$SIZE"  =~ ^[1-9][0-9]*$ ]] || die "--size 必须是正整数，当前是 '$SIZE'"
+[[ "$START" =~ ^[1-9][0-9]*$ ]] || die "--start 必须是正整数，当前是 '$START'"
 [[ -d "$SRC" ]]   || die "找不到源目录：$SRC"
 [[ -d "$INBOX" ]] || die "找不到收件目录：$INBOX"
 
@@ -89,8 +97,8 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 1. 找出「哪些一级子目录里面真的有图」
-#    一次 find 扫完，比每个目录各起一个 find 快得多。
+# 1. 先摸清楚上级目录里都有什么
+#    一次 find 扫完所有图片，比每个目录各起一个 find 快得多（一万个目录能差几十秒）。
 # --------------------------------------------------------------------------- #
 declare -A HAS_IMAGE=()
 while IFS= read -r rel; do
@@ -103,32 +111,47 @@ done < <(
 )
 
 # --------------------------------------------------------------------------- #
-# 2. 收集待拆分的一级子目录（按自然序：会处理 xx-2 / xx-10 这类编号）
-#    已存在的 batch-NNN 目录要排除掉，否则第二次运行会把自己刚建出来的批次再拆一遍。
+# 2. 收集待拆分的一级子目录（按自然序：xx-2 会排在 xx-10 前面）
+#    已存在的 batch-NNN 要排除掉，否则第二次运行会把上次切好的批次再切一遍。
+#    默认只收「里面有图」的目录 —— 没有图的目录无论如何都不会被当成商品
+#    （守护进程的 product_candidates 要求目录里必须有支持的图片），
+#    留着只会白占一个名额。
 # --------------------------------------------------------------------------- #
-ITEMS=()
+declare -A SEEN=()
+ALL_ITEMS=()
 while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     [[ "$name" =~ ^${PREFIX}-[0-9]+$ ]] && continue
-    ITEMS+=("$name")
+    [[ -n "${SEEN[$name]:-}" ]] && continue
+    SEEN["$name"]=1
+    ALL_ITEMS+=("$name")
 done < <(
     find "$SRC" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
         | sort -V
 )
 
-TOTAL=${#ITEMS[@]}
-WITH_IMAGE=0
-for item in "${ITEMS[@]}"; do
-    [[ -n "${HAS_IMAGE[$item]:-}" ]] && WITH_IMAGE=$((WITH_IMAGE + 1))
+ITEMS=()
+NO_IMAGE=0
+for item in "${ALL_ITEMS[@]}"; do
+    if [[ -n "${HAS_IMAGE[$item]:-}" ]]; then
+        ITEMS+=("$item")
+    else
+        NO_IMAGE=$((NO_IMAGE + 1))
+        [[ "$INCLUDE_NO_IMAGE" == "1" ]] && ITEMS+=("$item")
+    fi
 done
 
+TOTAL=${#ALL_ITEMS[@]}
+COUNT=${#ITEMS[@]}
+
 echo
-echo "源目录      : $SRC"
-echo "收件目录    : $INBOX"
-echo "一级子目录  : $TOTAL 个"
-echo "其中含图片  : $WITH_IMAGE 个"
-echo "每批商品数  : $SIZE"
-echo "批次命名    : ${PREFIX}-001, ${PREFIX}-002, ..."
+echo "源目录        : $SRC"
+echo "收件目录      : $INBOX"
+echo "一级子目录    : $TOTAL 个"
+echo "其中含图片    : $((TOTAL - NO_IMAGE)) 个"
+echo "本次要拆      : $COUNT 个"
+echo "每批商品数    : $SIZE"
+echo "起始批次号    : $START"
 
 if [[ "$TOTAL" -eq 0 ]]; then
     echo
@@ -136,44 +159,85 @@ if [[ "$TOTAL" -eq 0 ]]; then
     exit 0
 fi
 
-if [[ "$WITH_IMAGE" -eq 0 ]]; then
+if [[ "$COUNT" -eq 0 ]]; then
     echo
     echo "！！ 一级子目录里一张图都没找到。"
-    echo "   说明图片还在更深一层，也就是说 $SRC 下面第一层就已经是商品组了，"
-    echo "   守护进程会把整个 $SRC 当成「一个批次」处理。"
-    echo "   如果这本就是你要的，直接把 $SRC 移进 $INBOX 即可，不用拆。"
+    echo "   说明图片还在更深一层，也就是说 $SRC 的第一层本身就已经是「商品组」，"
+    echo "   守护进程会把整个 $SRC 当成一个批次。"
+    echo "   如果这本就是你要的，直接把 $SRC 移进 $INBOX 就行，不用拆。"
     exit 1
 fi
 
-if [[ "$WITH_IMAGE" -lt "$TOTAL" ]]; then
+if [[ "$NO_IMAGE" -gt 0 ]]; then
     echo
-    echo "提示：有 $((TOTAL - WITH_IMAGE)) 个一级子目录里没有图片，会被当成商品目录照常拆进去。"
-    echo "      如果它们是 noise（临时文件、日志目录），建议先清理再跑。"
+    if [[ "$INCLUDE_NO_IMAGE" == "1" ]]; then
+        echo "注意：勾选了 --include-no-image，这 $NO_IMAGE 个没图的目录也会被拆进去，"
+        echo "      守护进程会忽略它们（不会成为商品），但会占掉本批的名额。"
+    else
+        echo "已跳过 $NO_IMAGE 个没有图片的目录（它们不可能成为商品）："
+        shown=0
+        for item in "${ALL_ITEMS[@]}"; do
+            [[ -n "${HAS_IMAGE[$item]:-}" ]] && continue
+            echo "    - $item"
+            shown=$((shown + 1))
+            [[ "$shown" -ge 10 ]] && { echo "    ... 其余省略"; break; }
+        done
+    fi
 fi
 
-BATCHES=$(( (WITH_IMAGE + SIZE - 1) / SIZE ))
-echo "预计拆成    : $BATCHES 个批次"
+BATCHES=$(( (COUNT + SIZE - 1) / SIZE ))
+echo "预计拆成      : $BATCHES 个批次"
 echo
 
-if [[ "$DRY_RUN" == "1" ]]; then
-    echo "（--dry-run：只列计划，不移动任何文件）"
-fi
-
 # --------------------------------------------------------------------------- #
-# 3. 分批搬运
+# 3. 预检：把所有目标名先算出来，确认一个都没撞名
 # --------------------------------------------------------------------------- #
-declare -A CREATED=()
+declare -A TARGET_OF=()
 batch_no=0
 index=0
 for item in "${ITEMS[@]}"; do
     if (( index % SIZE == 0 )); then
         batch_no=$((batch_no + 1))
-        name=$(printf '%s-%03d' "$PREFIX" "$batch_no")
+        TARGET_OF["$batch_no"]=$(printf '%s-%03d' "$PREFIX" "$((START + batch_no - 1))")
+    fi
+    index=$((index + 1))
+done
+
+CLASH=0
+for ((n = 1; n <= batch_no; n++)); do
+    target="$INBOX/${TARGET_OF[$n]}"
+    if [[ -e "$target" ]]; then
+        echo "撞名：$target 已经存在"
+        CLASH=1
+    fi
+done
+if [[ "$CLASH" == "1" ]]; then
+    echo
+    echo "一个文件都还没动。换个批次号或前缀重试，例如："
+    echo "    ... --start $((START + batch_no))          # 从更大的号往下编"
+    echo "    ... --prefix run2                          # 换一眼前缀"
+    echo "    ... --dry-run                              # 先看看会拆成什么样"
+    exit 3
+fi
+echo "预检通过：$batch_no 个目标批次名都可用。"
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    echo
+    echo "（--dry-run：只列计划，不移动任何文件）"
+fi
+
+# --------------------------------------------------------------------------- #
+# 4. 真正搬运
+# --------------------------------------------------------------------------- #
+batch_no=0
+index=0
+for item in "${ITEMS[@]}"; do
+    if (( index % SIZE == 0 )); then
+        batch_no=$((batch_no + 1))
+        name="${TARGET_OF[$batch_no]}"
         target="$INBOX/$name"
-        CREATED[$name]=1
         echo "[$name]"
         if [[ "$DRY_RUN" != "1" ]]; then
-            [[ -e "$target" ]] && die "目标已存在：$target（先改名或删掉，别覆盖）"
             mkdir -p "$target"
         fi
     fi
