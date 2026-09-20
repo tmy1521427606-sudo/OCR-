@@ -125,6 +125,19 @@ sudo bash deploy/bootstrap-fresh-ubuntu.sh --app-dir /opt/ocr-v7 --user ubuntu
 预检会检查内网 OCR、PostgreSQL、GitHub、DashScope、163 SMTP 是否可达 —— 只报告不阻断，
 但这些不通的话批次跑不起来，建议先把网络搞清楚。
 
+**服务器访问不了 GitHub 时（内网很常见）**：在开发机上打一个不含 `.git` 的源码快照，
+再用 Xshell 的 Xftp / 拖拽上传 / `scp` 传过去，省得 clone 卡死：
+
+```bash
+# 开发机（Windows 也能用）—— 注意 -c core.autocrlf=false，原因见下方「常见报错」
+git -c core.autocrlf=false archive --format=tar.gz -o ocr-v7-latest.tar.gz HEAD
+
+# 服务器
+mkdir -p ~/OCR- && tar xzf ocr-v7-latest.tar.gz -C ~/OCR- && cd ~/OCR-
+```
+
+快照是**扁平结构**（顶层直接就是 `demo.py`、`deploy/`…），解压后铺在目标目录里，不会再套一层。
+
 已有 Python 和 git 的机器可以直接用：
 
 ```bash
@@ -140,6 +153,24 @@ sudo /opt/ocr-v7/.venv/bin/python /opt/ocr-v7/email_alert.py --self-test   # 先
 sudo systemctl enable --now ocr-v7-daemon
 journalctl -u ocr-v7-daemon -f
 ```
+
+### 常见报错
+
+**`deploy/xxx.sh: line NN: $'\r': command not found` / `: invalid option name`**
+
+脚本带的是 CRLF 换行，bash 把每行末尾那个 `\r` 当成命令名了。Windows 上打包最容易踩
+——`core.autocrlf=true` 时 `git archive` 会把 LF 转成 CRLF（不只是 checkout 会转）。
+现场一刀修好即可：
+
+```bash
+cd ~/OCR-
+for f in deploy/*.sh; do tr -d '\r' < "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done
+```
+
+检查是否还有残留：`grep -lU $'\r' deploy/*.sh`（无输出即干净）。
+
+仓库里已有 `.gitattributes` 强制 `deploy/*.sh`、`*.service` 等走 LF，
+重新打包/克隆不会再出现这个问题。手工打包时请带上 `-c core.autocrlf=false`。
 
 ### 手动运行
 
