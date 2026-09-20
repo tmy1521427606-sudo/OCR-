@@ -98,6 +98,13 @@ if ! "$APP_DIR/.venv/bin/pip" install 'psycopg[binary]>=3.2,<4'; then
     warn "psycopg[binary] 装不上，多半是当前平台没有对应的预编译 wheel。"
     warn "退回纯 Python 版 psycopg + 系统 libpq5（功能一致，性能略低）。"
     if command -v apt-get >/dev/null 2>&1; then
+        # 这两个变量缺一不可：
+        #   DEBIAN_FRONTEND=noninteractive 管 debconf 的对话框；
+        #   NEEDRESTART_SUSPEND=1          管 Ubuntu 的「哪些服务需要重启」交互提示
+        #   —— 少了后者，无人值守时会一直卡在
+        #      "Which services should be restarted? []" 上等输入。
+        export DEBIAN_FRONTEND=noninteractive
+        export NEEDRESTART_SUSPEND=1
         apt-get update -qq || warn "apt-get update 失败，继续尝试"
         apt-get install -y libpq5 || warn "libpq5 安装失败，继续尝试"
     fi

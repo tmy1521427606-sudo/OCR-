@@ -61,7 +61,11 @@ die()  { printf '\033[1;31m[ fail ]\033[0m %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 if [[ "$SKIP_DEPS" == "0" && "$CHECK_ONLY" == "0" ]]; then
     log "apt-get update"
+    # DEBIAN_FRONTEND 管 debconf 对话框；NEEDRESTART_SUSPEND 管 Ubuntu 的
+    # 「Which services should be restarted? []」交互提示 —— 少了它，
+    # 无人值守的安装会一直停在那里等回车。
     export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_SUSPEND=1
     apt-get update -qq
 
     MISSING=()

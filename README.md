@@ -114,6 +114,11 @@ git clone https://github.com/tmy1521427606-sudo/OCR-.git
 cd OCR- && git checkout linux-daemon-email-alert
 ```
 
+> apt 中途如果停在 `Which services should be restarted? []` 上等输入，那是 Ubuntu 的
+> `needrestart` 交互提示，直接按**回车**走默认值即可。想一次性规避：
+> `sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt install -y ...`
+> （两个脚本里都已经帮你设好了这两个变量）
+
 然后用引导脚本，它会做连通性预检再自动调用下面的 `install-linux.sh`：
 
 ```bash
@@ -171,6 +176,33 @@ for f in deploy/*.sh; do tr -d '\r' < "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done
 
 仓库里已有 `.gitattributes` 强制 `deploy/*.sh`、`*.service` 等走 LF，
 重新打包/克隆不会再出现这个问题。手工打包时请带上 `-c core.autocrlf=false`。
+
+**apt 卡在 `Which services should be restarted? []` 不动了**
+
+不是卡死，是 Ubuntu 的 `needrestart` 在等输入：
+
+```
+Restarting services...
+Daemons using outdated libraries
+---------------------------
+1. packagekit.service  2. none of the above
+
+Which services should be restarted? []
+```
+
+**直接按回车**（默认就是 2，不重启任何服务）即可继续。
+
+`DEBIAN_FRONTEND=noninteractive` **管不住它** —— needrestart 有自己的配置，
+要用它自己的开关：
+
+```bash
+sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get install -y <包名>
+
+# 或者永久关掉这台机器的这个提示
+echo '$nrconf{restart} = "a";' | sudo tee /etc/needrestart/conf.d/99-auto.conf
+```
+
+`deploy/` 下的两个脚本都已经把这两个变量设好了，以后自动装依赖不会再停。
 
 **`ERROR: Cannot install psycopg[...] and psycopg-binary==3.2.0, ... because these package versions have conflicting dependencies`**
 
