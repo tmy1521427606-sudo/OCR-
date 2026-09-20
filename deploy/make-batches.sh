@@ -36,6 +36,14 @@
 # 安全策略：先把所有目标批次名算出来，确认没有一个跟已有目录撞名，再开始搬。
 #           不会出现「搬到一半发现撞名、留下半个批次」的情况。
 #
+# 其它开关：
+#   --prefix NAME        批次名前缀，默认 batch
+#   --start N            起始批次号，默认 1（撞名时用它往上跳，别覆盖旧批次）
+#   --force              守护进程正在跑也照拆（它可能读到半个批次，慎用）
+#   --include-no-image   连「目录里没有图」的一级目录也拆进去（默认跳过，它们不可能是商品）
+#   --allow-container    确实要把容器目录当成一个商品时用（默认会拦下来）
+#   --help               看这段说明
+#
 set -euo pipefail
 
 SRC=""
@@ -46,9 +54,11 @@ START=1
 DRY_RUN=0
 FORCE=0
 INCLUDE_NO_IMAGE=0
+ALLOW_CONTAINER=0
 
 usage() {
-    sed -n '3,42p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'
+    # 把文件开头的注释整块当说明打出来，改注释不用同步改行号
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
 }
 
 die() { echo "错误：$*" >&2; exit 2; }
@@ -63,6 +73,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=1;        shift ;;
         --force)   FORCE=1;          shift ;;
         --include-no-image) INCLUDE_NO_IMAGE=1; shift ;;
+        --allow-container)  ALLOW_CONTAINER=1;   shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "未知参数：$1（用 --help 看用法）" ;;
     esac
@@ -101,8 +112,18 @@ fi
 #    一次 find 扫完所有图片，比每个目录各起一个 find 快得多（一万个目录能差几十秒）。
 # --------------------------------------------------------------------------- #
 declare -A HAS_IMAGE=()
+declare -A HAS_DIRECT_IMAGE=()   # 图片就在这一层（item/xxx.jpg）—— 正常的商品目录长这样
+declare -A HAS_NESTED_IMAGE=()   # 图片在更深一层（item/sub/xxx.jpg）—— 可能是个容器
 while IFS= read -r rel; do
-    [[ -n "$rel" ]] && HAS_IMAGE["${rel%%/*}"]=1
+    [[ -n "$rel" ]] || continue
+    item="${rel%%/*}"
+    rest="${rel#*/}"
+    HAS_IMAGE["$item"]=1
+    if [[ "$rest" == */* ]]; then
+        HAS_NESTED_IMAGE["$item"]=1
+    else
+        HAS_DIRECT_IMAGE["$item"]=1
+    fi
 done < <(
     find "$SRC" -mindepth 2 -type f \
         \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \
@@ -183,6 +204,39 @@ if [[ "$NO_IMAGE" -gt 0 ]]; then
             [[ "$shown" -ge 10 ]] && { echo "    ... 其余省略"; break; }
         done
     fi
+fi
+
+CONTAINERS=()
+for item in "${ITEMS[@]}"; do
+    [[ -n "${HAS_NESTED_IMAGE[$item]:-}" ]] || continue
+    [[ -n "${HAS_DIRECT_IMAGE[$item]:-}" ]] && continue
+    CONTAINERS+=("$item")
+done
+
+if [[ "${#CONTAINERS[@]}" -gt 0 ]]; then
+    echo
+    echo "！！ 有几个目录看着是「容器」，不像商品。"
+    echo "   它们的图不在自己这一层，而在更深一层，说明它们本身就是装商品目录的文件夹"
+    echo "   （比如你直接把 jd_image 这个总目录整包上传了）："
+    for item in "${CONTAINERS[@]}"; do
+        echo "    - $item"
+    done
+    echo
+    echo "   一个商品目录长这样：  100003043680/  <- 图直接放在这里面"
+    echo "   一个容器长这样：      jd_image/100003043680/  <- 还会再套一层"
+    echo
+    echo "   如果不加处理就拆，上面这个容器会占掉一个商品名额，它下面的图会全部算成"
+    echo "   「同一个商品」的图片 —— 白跑很久，还出一份废数据。"
+    if [[ "$ALLOW_CONTAINER" != "1" ]]; then
+        echo
+        echo "   一个文件都还没动。正确做法是把 --src 指到更深一层，也就是商品目录所在的那一层："
+        echo "        sudo bash $0 --src $SRC/<容器名> --inbox $INBOX --size $SIZE --dry-run"
+        echo "   确认 $SRC/<容器名> 打开后每个子目录里直接就是图，去掉 --dry-run 再跑一次。"
+        echo "   （确实想把容器当商品用，再加 --allow-container。）"
+        exit 4
+    fi
+    echo
+    echo "   --allow-container 已指定，继续按容器处理。"
 fi
 
 BATCHES=$(( (COUNT + SIZE - 1) / SIZE ))
