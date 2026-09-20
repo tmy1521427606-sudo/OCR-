@@ -29,7 +29,25 @@
 ``ALERT_ON_SUCCESS``          运行成功时是否也发邮件，默认 ``1``
 ``ALERT_ATTACH_ARTIFACTS``    是否附带 performance.json / 待复核图片.json，默认 ``1``
 ``ALERT_SMTP_TIMEOUT``        网络超时秒数，默认 ``30``
+``ALERT_EMPTY_PRODUCT_MIN_FIELDS``
+                              一个商品至少要有几个核心字段非空才算「识别出来了」，
+                              默认 ``1``（即核心字段全空才报警）
 ============================  ====================================================
+
+报警触发点一览（都在 :mod:`ocr_daemon` 里调用）：
+
+============================  ==================================  ==========
+触发条件                      调用                                 级别
+============================  ==================================  ==========
+批次跑完（成功 / 待复核 / 失败）  :func:`notify_pipeline_result`       success / warning / error
+批次抛出异常                    :func:`notify_pipeline_failure`      error
+CSV 没生成 / 一行数据都没有       :func:`notify_artifacts_missing`     error
+商品核心字段全空                 :func:`notify_products_empty`        warning
+守护进程被中断 / 非正常退出        :func:`notify_daemon_stopped`        warning / error
+批次长时间没有进度                :func:`notify_stuck`                 error
+内网 OCR 服务探活失败 / 恢复       :func:`notify_ocr_probe`             error / info
+启动前配置不全                   :func:`notify`                       critical
+============================  ==================================  ==========
 
 自检（会真的发一封测试邮件）：::
 
@@ -158,6 +176,12 @@ def mail_config() -> MailConfig:
         attach_artifacts=_env_flag("ALERT_ATTACH_ARTIFACTS", True),
         timeout=_env_int("ALERT_SMTP_TIMEOUT", DEFAULT_TIMEOUT),
     )
+
+
+def empty_product_min_fields() -> int:
+    """一个商品至少要几个核心字段非空，才算「识别出来了」。默认 1。"""
+    value = _env_int("ALERT_EMPTY_PRODUCT_MIN_FIELDS", 1)
+    return max(0, value)
 
 
 def _attach_file(message: EmailMessage, path: Path) -> bool:
@@ -342,15 +366,44 @@ def notify_pipeline_result(
     performance = result.get("performance") or {}
     ocr = performance.get("ocr") or {}
 
+    # 产物审计信息由 ocr_daemon.run_one_batch 汇总后塞进 result 里。
+    product_count = int(result.get("product_count") or 0)
+    csv_paths = [str(item) for item in (result.get("csv_files") or []) if item]
+    csv_missing = [str(item) for item in (result.get("csv_missing") or []) if item]
+    csv_rows = int(result.get("csv_rows") or 0)
+    empty_products = [item for item in (result.get("empty_products") or []) if isinstance(item, dict)]
+    min_fields = empty_product_min_fields()
+
     lines = [
         f"批次：{batch_label}",
         f"运行 ID：{result.get('run_id') or '-'}",
         f"状态：{status}",
-        f"商品：成功 {success_count} 个，待复核 {review_count} 个",
+        f"商品：成功 {success_count} 个，待复核 {review_count} 个，合计 {product_count} 个",
         f"输出目录：{result.get('output_dir') or '-'}",
     ]
-    if result.get("workbook"):
-        lines.append(f"结果文件：{Path(str(result['workbook'])).name}")
+    lines.append(
+        f"Excel：{Path(str(result['workbook'])).name}" if result.get("workbook") else "Excel：未生成"
+    )
+
+    # ---- 产物检查：CSV 有没有生成、有没有数据 ----
+    lines.append("")
+    lines.append("—— 产物检查 ——")
+    lines.append(f"CSV：{len(csv_paths)} 个文件，合计 {csv_rows} 行数据")
+    for item in csv_paths[:10]:
+        lines.append(f"  {item}")
+    if len(csv_paths) > 10:
+        lines.append(f"  ...其余 {len(csv_paths) - 10} 个见输出目录")
+    if csv_missing:
+        lines.append("")
+        lines.append(f"!! {len(csv_missing)} 个批次块没有生成 CSV（完整列表见单独告警邮件）：")
+        for item in csv_missing[:3]:
+            lines.append(f"  {item}")
+        if len(csv_missing) > 3:
+            lines.append(f"  ...其余 {len(csv_missing) - 3} 条见单独告警邮件")
+    if product_count and csv_rows < product_count:
+        lines.append("")
+        lines.append(f"!! CSV 只有 {csv_rows} 行，少于商品数 {product_count} 行，有商品没写进结果文件。")
+
     lines.append("")
     lines.append("—— 性能摘要 ——")
     lines.append(f"总耗时：{_format_duration(performance.get('total_ms'))}")
@@ -379,7 +432,29 @@ def notify_pipeline_result(
         if len(review_images) > 20:
             lines.append(f"  ...其余 {len(review_images) - 20} 条见待复核图片.json")
 
-    if status == "complete":
+    if empty_products:
+        lines.append("")
+        lines.append(
+            f"—— 完全没识别出来的商品 {len(empty_products)} 个"
+            f"（完整列表见单独告警邮件，这里只列前 5 条）——"
+        )
+        lines.append(f"（判定：核心字段里非空值少于 {min_fields} 个）")
+        for item in empty_products[:5]:
+            note = item.get("note") or "核心字段全部为空"
+            best = item.get("best_run_id") or "-"
+            lines.append(f"  {item.get('product_id', '-')}：{note}（run {best}）")
+        if len(empty_products) > 5:
+            lines.append(f"  ...其余 {len(empty_products) - 5} 个见单独告警邮件")
+
+    # ---- 定级：产物缺失 > 商品全空 > 管线自身状态 ----
+    artifact_error = bool(csv_missing) or (product_count > 0 and csv_rows == 0)
+    if artifact_error:
+        severity = "error"
+        title = f"批次没有产出结果文件：{batch_label}"
+    elif empty_products:
+        severity = "warning"
+        title = f"批次有 {len(empty_products)} 个商品完全没识别出来：{batch_label}"
+    elif status == "complete":
         severity = "success"
         if not resolved.alert_on_success:
             LOGGER.info("批次 %s 运行成功，ALERT_ON_SUCCESS=0，跳过邮件", batch_label)
@@ -441,6 +516,198 @@ def notify_pipeline_failure(
     )
 
 
+def notify_products_empty(
+    *,
+    batch_label: str,
+    empty_products: Sequence[dict[str, Any]],
+    total_products: int,
+    min_fields: int | None = None,
+    output_dir: Path | None = None,
+    config: MailConfig | None = None,
+) -> bool:
+    """有商品「什么都没识别出来」时单独告警（不等批次汇总）。"""
+    resolved = config or mail_config()
+    threshold = empty_product_min_fields() if min_fields is None else max(0, min_fields)
+    lines = [
+        f"批次：{batch_label}",
+        f"商品总数：{total_products} 个，其中 {len(empty_products)} 个核心字段全空",
+        f"判定标准：核心字段里非空值少于 {threshold} 个",
+        f"输出目录：{output_dir or '-'}",
+        "",
+        "—— 明细（最多 30 条）——",
+    ]
+    for item in list(empty_products)[:30]:
+        lines.append(f"  {item.get('product_id', '-')}：{item.get('note') or '核心字段全部为空'}")
+    if len(empty_products) > 30:
+        lines.append(f"  ...其余 {len(empty_products) - 30} 个见输出目录下 products/ 的商品 JSON")
+    lines.append("")
+    lines.append("—— 排查建议 ——")
+    lines.append("1. 打开该商品目录，确认图片是否真的能看清文字（纯色条 / 切片图会识别不出）；")
+    lines.append("2. 查 OCR 服务日志里对应图片的 log_id，看是不是 422 / 超时；")
+    lines.append("3. 确认该 product_id 在主数据表里存在（否则数据库侧全空，只剩 OCR 一条路）。")
+
+    return notify(
+        f"有商品完全没识别出来：{batch_label}（{len(empty_products)} 个）",
+        lines,
+        severity="warning",
+        config=resolved,
+    )
+
+
+def notify_artifacts_missing(
+    *,
+    batch_label: str,
+    missing: Sequence[str],
+    expected: int,
+    output_dir: Path | None = None,
+    config: MailConfig | None = None,
+) -> bool:
+    """结果文件（CSV）没生成、或生成了一行数据都没有时告警。"""
+    resolved = config or mail_config()
+    lines = [
+        f"批次：{batch_label}",
+        f"应该有 {expected} 个结果文件，实际缺失 {len(missing)} 个",
+        f"输出目录：{output_dir or '-'}",
+        "",
+        "—— 缺失明细（最多 20 条）——",
+    ]
+    for item in list(missing)[:20]:
+        lines.append(f"  {item}")
+    if len(missing) > 20:
+        lines.append(f"  ...其余 {len(missing) - 20} 条")
+    lines.append("")
+    lines.append("—— 排查建议 ——")
+    lines.append("1. 直接看上面的目录里有没有 result.csv / result.xlsx；")
+    lines.append("2. 看同目录的 report.html 与 performance.json，确认管线走到哪一步断的；")
+    lines.append("3. 看日志里最后一次 [pipeline] 输出，定位卡在 OCR、数据库还是导出环节。")
+
+    return notify(
+        f"批次没有产出结果文件：{batch_label}",
+        lines,
+        severity="error",
+        attachments=_artifact_paths(output_dir),
+        config=resolved,
+    )
+
+
+def notify_daemon_stopped(
+    *,
+    reason: str,
+    severity: str = "warning",
+    batch_label: str = "",
+    batch_status: str = "",
+    output_dir: Path | None = None,
+    config: MailConfig | None = None,
+) -> bool:
+    """守护进程被中断 / 非正常退出时告警。
+
+    「优雅停止」（收到一次 SIGTERM 且当前批次跑完）也会通知，但级别是 ``info``，
+    便于区分「人主动停的」和「进程被弄死了」。
+    """
+    resolved = config or mail_config()
+    lines = [
+        f"原因：{reason}",
+    ]
+    if batch_label:
+        lines.append(f"批次：{batch_label}")
+    if batch_status:
+        lines.append(f"批次状态：{batch_status}")
+    if output_dir:
+        lines.append(f"输出目录：{output_dir}")
+        lines.append("已完成的产物都在上面的目录里，重启服务会自动断点续跑。")
+    lines.append("")
+    lines.append("—— 排查建议 ——")
+    if severity == "info":
+        lines.append("1. 这是收到一次停止信号后的正常收尾退出，确认是本人操作即可忽略；")
+        lines.append("2. 重启：sudo systemctl start ocr-v7-daemon。")
+    else:
+        lines.append("1. systemctl status ocr-v7-daemon 看是不是被 OOM / 超时杀掉；")
+        lines.append("2. journalctl -u ocr-v7-daemon -n 200 看退出前最后几行；")
+        lines.append("3. 进程若已被 kill -9，本机不会再发邮件，靠这条「重启后发现上次未收尾」记录判断。")
+
+    return notify(
+        f"后台服务已退出：{reason}",
+        lines,
+        severity=severity,
+        attachments=_artifact_paths(output_dir),
+        config=resolved,
+    )
+
+
+def notify_stuck(
+    *,
+    batch_label: str,
+    stuck_minutes: float,
+    last_progress: str = "",
+    output_dir: Path | None = None,
+    config: MailConfig | None = None,
+) -> bool:
+    """批次长时间没有进度时告警（看门狗触发）。"""
+    resolved = config or mail_config()
+    lines = [
+        f"批次：{batch_label}",
+        f"已连续 {stuck_minutes:.0f} 分钟没有任何进度输出，疑似卡住。",
+        f"最后一次进度：{last_progress or '（进程启动后一直没有进度）'}",
+        f"输出目录：{output_dir or '-'}",
+        "",
+        "—— 说明 ——",
+        "服务仍在运行，不会自杀。后续一旦有新进度会恢复正常，本条只发一次。",
+        "",
+        "—— 排查建议 ——",
+        "1. 内网 OCR 服务是否被限流 / 挂起（看 OCR 侧日志）；",
+        "2. 单张图片是否特别大导致 OCR 侧长时间无响应；",
+        "3. 是否卡在数据库查询（PostgreSQL 侧看 pg_stat_activity）；",
+        "4. 确认没有人工在等交互输入 —— 服务模式下任何 input() 都会卡死。",
+    ]
+
+    return notify(
+        f"批次疑似卡住：{batch_label}（{stuck_minutes:.0f} 分钟无进度）",
+        lines,
+        severity="error",
+        attachments=_artifact_paths(output_dir),
+        config=resolved,
+    )
+
+
+def notify_ocr_probe(
+    *,
+    url: str,
+    host: str,
+    port: int,
+    down: bool,
+    consecutive: int = 1,
+    detail: str = "",
+    config: MailConfig | None = None,
+) -> bool:
+    """内网 OCR 服务探活失败 / 恢复时告警。"""
+    resolved = config or mail_config()
+    if down:
+        lines = [
+            f"OCR 地址：{url}",
+            f"探测目标：{host}:{port}",
+            f"连续失败：{consecutive} 次",
+            f"错误：{detail or '连接失败'}",
+            "",
+            "—— 说明 ——",
+            "只影响新批次的 OCR 阶段；已在跑的批次会自动退避重试，不会丢数据。",
+            "如果这台 OCR 服务本来就有定时停机窗口，把它写进",
+            "ALERT_OCR_MAINTENANCE_WINDOWS（如 14:00-18:00）就不会在窗口内报警。",
+        ]
+        title = f"内网 OCR 服务不可达（连续 {consecutive} 次）"
+        severity = "error"
+    else:
+        lines = [
+            f"OCR 地址：{url}",
+            f"探测目标：{host}:{port}",
+            "",
+            "服务已恢复响应，新的批次可以正常跑。",
+        ]
+        title = "内网 OCR 服务已恢复"
+        severity = "info"
+
+    return notify(title, lines, severity=severity, config=resolved)
+
+
 def self_test(*, dry_run: bool = False) -> int:
     """命令行自检：打印配置（不含密码），可选真的发一封测试邮件。"""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -466,11 +733,156 @@ def self_test(*, dry_run: bool = False) -> int:
     return 0 if ok else 1
 
 
+def preview_all() -> int:
+    """把每一种报警邮件的主题和正文打印出来，**不发信**。
+
+    用途：OCR 服务不在线时也能核对报警文案；改完模板后肉眼验收。
+    """
+    captured: list[tuple[str, str]] = []
+    original = globals()["send_mail"]
+
+    def _fake_send(subject: str, body: str, **_kwargs: Any) -> bool:
+        captured.append((subject, body))
+        return True
+
+    globals()["send_mail"] = _fake_send  # type: ignore[assignment]
+    try:
+        config = mail_config()
+        sample_perf = {
+            "total_ms": 1_842_000,
+            "ocr": {
+                "planned_images": 812,
+                "success_images": 800,
+                "failed_images": 12,
+                "cache_hits": 640,
+                "success_p50_ms": 2100,
+                "success_p95_ms": 5400,
+            },
+        }
+        notify_pipeline_result(
+            {
+                "status": "complete",
+                "run_id": "20260920-180500-abc123",
+                "output_dir": "/var/lib/ocr-v7/runs/2026-09-20/20260920-180500-abc123",
+                "workbook": "/var/lib/ocr-v7/runs/2026-09-20/.../result.xlsx",
+                "success_count": 500,
+                "review_count": 0,
+                "product_count": 500,
+                "csv_files": ["/var/lib/ocr-v7/runs/2026-09-20/.../result.csv"],
+                "csv_rows": 500,
+                "performance": sample_perf,
+            },
+            batch_label="2026-09-20",
+            config=config,
+        )
+        notify_pipeline_result(
+            {
+                "status": "review",
+                "run_id": "20260920-180500-abc123",
+                "output_dir": "/var/lib/ocr-v7/runs/2026-09-20/20260920-180500-abc123",
+                "workbook": "/var/lib/ocr-v7/runs/2026-09-20/.../result.xlsx",
+                "success_count": 492,
+                "review_count": 8,
+                "product_count": 500,
+                "csv_files": ["/var/lib/ocr-v7/runs/2026-09-20/.../result.csv"],
+                "csv_rows": 495,
+                "empty_products": [
+                    {"product_id": "100005996353", "note": "核心字段全部为空", "best_run_id": "r1"},
+                    {"product_id": "100011526893", "note": "仅识别出商品名称", "best_run_id": "r1"},
+                ],
+                "performance": sample_perf,
+            },
+            batch_label="2026-09-20",
+            config=config,
+        )
+        notify_artifacts_missing(
+            batch_label="2026-09-20",
+            missing=["第 2/5 块（run 20260920-183000-def456）没有生成 result.csv"],
+            expected=5,
+            output_dir=Path("/var/lib/ocr-v7/runs/2026-09-20/20260920-180500-abc123"),
+            config=config,
+        )
+        notify_products_empty(
+            batch_label="2026-09-20",
+            empty_products=[
+                {"product_id": "100005996353", "note": "核心字段全部为空"},
+                {"product_id": "100011526893", "note": "核心字段全部为空"},
+            ],
+            total_products=500,
+            output_dir=Path("/var/lib/ocr-v7/runs/2026-09-20/20260920-180500-abc123"),
+            config=config,
+        )
+        notify_pipeline_failure(
+            batch_label="2026-09-20",
+            error_code="PADDLE_OCR_INTERRUPTED",
+            message="内网 OCR 服务连续 3 次请求失败，已暂停本批次",
+            output_dir=Path("/var/lib/ocr-v7/runs/2026-09-20/20260920-180500-abc123"),
+            retry_in_seconds=300,
+            config=config,
+        )
+        notify_daemon_stopped(
+            reason="收到 SIGTERM：当前批次跑完后退出（systemctl stop）",
+            severity="info",
+            batch_label="2026-09-20",
+            batch_status="complete",
+            output_dir=Path("/var/lib/ocr-v7/runs/2026-09-20/20260920-180500-abc123"),
+            config=config,
+        )
+        notify_daemon_stopped(
+            reason="再次收到 SIGINT：立即退出（批次 2026-09-20 未收尾）",
+            severity="error",
+            batch_label="2026-09-20",
+            batch_status="interrupted",
+            output_dir=Path("/var/lib/ocr-v7/runs/2026-09-20/20260920-180500-abc123"),
+            config=config,
+        )
+        notify_stuck(
+            batch_label="2026-09-20",
+            stuck_minutes=30,
+            last_progress="[pipeline] 100/500 OCR 完成（第 100 张已返回）",
+            output_dir=Path("/var/lib/ocr-v7/runs/2026-09-20/20260920-180500-abc123"),
+            config=config,
+        )
+        notify_ocr_probe(
+            url="http://192.168.1.115:8870/v1/ocr",
+            host="192.168.1.115",
+            port=8870,
+            down=True,
+            consecutive=3,
+            detail="Connection refused",
+            config=config,
+        )
+        notify_ocr_probe(
+            url="http://192.168.1.115:8870/v1/ocr",
+            host="192.168.1.115",
+            port=8870,
+            down=False,
+            config=config,
+        )
+    finally:
+        globals()["send_mail"] = original  # type: ignore[assignment]
+
+    print(f"共 {len(captured)} 封报警邮件预览（未发送）：")
+    for index, (subject, body) in enumerate(captured, start=1):
+        print("")
+        print("=" * 72)
+        print(f"[{index}] 主题：{subject}")
+        print("-" * 72)
+        print(body)
+    print("=" * 72)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="OCR v7 邮件报警自检")
     parser.add_argument("--self-test", action="store_true", help="发送一封测试邮件")
     parser.add_argument("--dry-run", action="store_true", help="只打印配置，不发送")
+    parser.add_argument(
+        "--preview", action="store_true", help="打印全部报警邮件正文（不发信），用于核对文案"
+    )
     args = parser.parse_args(argv)
+    if args.preview:
+        return preview_all()
     if not args.self_test:
         parser.print_help()
         return 0

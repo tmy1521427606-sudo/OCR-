@@ -35,6 +35,13 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 # 收件目录 / 平台 / 并发数都从上面的 EnvironmentFile 读取
 # （OCR_INPUT_ROOT、OCR_DEMO_PLATFORM、OCR_WORKERS），
 # 这里刻意不做 ${VAR} 展开，避免变量没定义时把参数吞掉导致启动失败。
+#
+# 报警与批次块大小也全部走 env，不用改这里：
+#   OCR_CHUNK_SIZE=500                  一个批次块最多几个商品
+#   ALERT_OCR_MAINTENANCE_WINDOWS       如 14:00-18:00，窗口内不报「OCR 不可达」
+#   OCR_PROBE_INTERVAL / OCR_PROBE_FAILURES / OCR_PROBE_REPEAT
+#   OCR_STUCK_MINUTES                   多久没进度算「卡住」
+#   ALERT_EMPTY_PRODUCT_MIN_FIELDS      核心字段非空少于几个算「没识别出来」
 ExecStart=/opt/ocr-v7/.venv/bin/python /opt/ocr-v7/ocr_daemon.py \
     --state-dir /var/lib/ocr-v7/state \
     --output-root /var/lib/ocr-v7/runs \

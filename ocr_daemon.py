@@ -25,23 +25,31 @@
   再收到一次信号则立即退出。
 * **失败退避**：OCR 服务中断 / 网络中断会在退避时间后自动重试，直到成功或
   达到 ``--max-attempts`` 上限。
-* **邮件报警**：见 :mod:`email_alert`。
+* **邮件报警**：见 :mod:`email_alert`。会发邮件的情况：批次正常结束（汇总）、
+  批次抛错、**没产出 result.csv**、**有商品核心字段全空**、**批次长时间没进度**、
+  **内网 OCR 探活失败/恢复**、**服务被中断或上次非正常退出**。
+  内网 OCR 有固定停机窗口时用 ``ALERT_OCR_MAINTENANCE_WINDOWS`` 声明，
+  窗口内探活失败不算故障。
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
 import signal
+import socket
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from urllib.parse import urlsplit
 
 import demo
 import email_alert
@@ -76,11 +84,69 @@ RETRYABLE_ERROR_CODES = {
 
 LEDGER_VERSION = 1
 
+#: 服务端单个批次块允许的商品数上限。
+#: ``demo.MAX_PRODUCTS``(100) 是 demo.py 交互式选商品的限制，服务端没人交互，
+#: 这里放宽到 500；相应地 ``build_manifest`` 必须传 ``allow_many=True``。
+MAX_CHUNK_SIZE = 500
+DEFAULT_CHUNK_SIZE = 500
+
+#: 判定「这个商品到底有没有识别出东西」只看这些核心字段（用户拍板的清单）。
+#: 全部为空才算「完全没识别出来」。
+CORE_METRIC_FIELDS = (
+    "规格",
+    "包装",
+    "规格总量",
+    "最小单位价格",
+    "是否多规格",
+    "日服量",
+    "最小日服量",
+    "最大日服量",
+    "最小日服成本",
+    "最大日服成本",
+    "成分",
+    "人群",
+    "功能",
+    "品牌",
+    "剂型",
+    "蓝帽标识",
+    "代工厂",
+)
+
+#: CSV 里这些取值等同于「空」。导出时 list/dict 会被 json.dumps 成 "[]" / "{}"。
+_BLANK_TOKENS = {"", "[]", "{}", "null", "none"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        LOGGER.warning("环境变量 %s=%r 不是数字，回退为 %s", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        LOGGER.warning("环境变量 %s=%r 不是整数，回退为 %s", name, raw, default)
+        return default
+
 
 # --------------------------------------------------------------------------- #
 # 日志
 # --------------------------------------------------------------------------- #
-def configure_logging(log_file: Path | None, *, verbose: bool = False) -> None:
+def configure_logging(
+    log_file: Path | None,
+    *,
+    verbose: bool = False,
+    watchdog: ProgressWatchdog | None = None,
+) -> None:
     """同时输出到 stdout（systemd 收进 journal）和日志文件。"""
     level = logging.DEBUG if verbose else logging.INFO
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
@@ -96,8 +162,15 @@ def configure_logging(log_file: Path | None, *, verbose: bool = False) -> None:
         handlers=handlers,
         force=True,
     )
-    # demo.py 用 print 打进度，这里把它的输出也标注一下来源，方便 grep。
-    demo.progress = lambda message: LOGGER.info("[pipeline] %s", message)  # type: ignore[assignment]
+
+    # demo.py 用 print 打进度，这里把它的输出也标注一下来源，方便 grep；
+    # 同时把进度喂给看门狗作为「还活着」的心跳。
+    def _progress(message: str) -> None:
+        LOGGER.info("[pipeline] %s", message)
+        if watchdog is not None:
+            watchdog.beat(str(message))
+
+    demo.progress = _progress  # type: ignore[assignment]
 
 
 # --------------------------------------------------------------------------- #
@@ -183,6 +256,323 @@ class StopController:
                 return False
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
         return not self.requested
+
+
+# --------------------------------------------------------------------------- #
+# 停机窗口
+# --------------------------------------------------------------------------- #
+def _parse_hhmm(text: str) -> int | None:
+    parts = text.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def parse_maintenance_windows(raw: str) -> tuple[tuple[int, int], ...]:
+    """解析 ``14:00-18:00,02:00-02:30`` 形式的 OCR 停机窗口（支持跨零点）。
+
+    内网 OCR 服务每天固定时段关停时，把窗口写进 ``ALERT_OCR_MAINTENANCE_WINDOWS``，
+    窗口内探活失败就不发告警，避免每天收到两封无意义的「服务不可达」。
+    """
+    windows: list[tuple[int, int]] = []
+    for chunk in str(raw or "").replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        left, separator, right = chunk.partition("-")
+        start = _parse_hhmm(left) if separator else None
+        end = _parse_hhmm(right) if separator else None
+        if start is None or end is None:
+            LOGGER.warning("停机窗口 %r 无法解析（应为 14:00-18:00），已忽略", chunk)
+            continue
+        windows.append((start, end))
+    return tuple(windows)
+
+
+def in_maintenance_window(
+    windows: Sequence[tuple[int, int]], when: datetime | None = None
+) -> bool:
+    now = when or datetime.now(CST)
+    minute = now.hour * 60 + now.minute
+    for start, end in windows:
+        if start <= end:
+            if start <= minute < end:
+                return True
+        elif minute >= start or minute < end:  # 跨零点，如 23:30-01:00
+            return True
+    return False
+
+
+def _describe_windows(windows: Sequence[tuple[int, int]]) -> str:
+    return "、".join(f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}" for start, end in windows)
+
+
+# --------------------------------------------------------------------------- #
+# 卡住看门狗
+# --------------------------------------------------------------------------- #
+class ProgressWatchdog:
+    """后台线程盯着「多久没有进度输出」，超时发一次告警。
+
+    只看 ``demo.progress`` 推来的进度；跑完一批就撤防，所以空闲等待新批次时
+    不会误报。发出告警后若又来了新进度，会记一条「已恢复」并重新武装，
+    下次再卡住还能再报一次。
+    """
+
+    def __init__(
+        self,
+        timeout_seconds: float,
+        *,
+        interval: float = 30.0,
+        notify_fn: Callable[[str, float, str, Path | None], bool] | None = None,
+        mail: email_alert.MailConfig | None = None,
+    ) -> None:
+        self.timeout = float(timeout_seconds)
+        self.interval = float(interval)
+        self._notify_fn = notify_fn
+        self._mail = mail
+        self._lock = threading.Lock()
+        self._batch = ""
+        self._output_dir: Path | None = None
+        self._last_progress = 0.0
+        self._last_wall = ""
+        self._last_message = ""
+        self._alerted = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="ocr-watchdog", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+
+    def begin_batch(self, batch_label: str, output_dir: Path | None = None) -> None:
+        with self._lock:
+            self._batch = batch_label
+            self._output_dir = output_dir
+            self._last_progress = time.monotonic()
+            self._last_wall = datetime.now(CST).strftime("%H:%M:%S")
+            self._last_message = ""
+            self._alerted = False
+
+    def end_batch(self) -> None:
+        with self._lock:
+            self._batch = ""
+
+    def beat(self, message: str = "") -> None:
+        with self._lock:
+            self._last_progress = time.monotonic()
+            self._last_wall = datetime.now(CST).strftime("%H:%M:%S")
+            if message:
+                self._last_message = str(message)
+            if self._alerted:
+                self._alerted = False
+                LOGGER.info("看门狗：批次恢复有进度输出，重新开始计时")
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            payload: tuple[str, float, str, Path | None] | None = None
+            with self._lock:
+                if not self._batch or self._alerted:
+                    continue
+                idle = time.monotonic() - self._last_progress
+                if idle < self.timeout:
+                    continue
+                self._alerted = True
+                payload = (
+                    self._batch,
+                    idle / 60.0,
+                    f"{self._last_wall} {self._last_message}".strip(),
+                    self._output_dir,
+                )
+            if payload is None:
+                continue
+            batch_label, minutes, last_message, output_dir = payload
+            LOGGER.error("看门狗：批次 %s 已 %.0f 分钟无进度输出", batch_label, minutes)
+            if self._notify_fn is not None:
+                self._notify_fn(batch_label, minutes, last_message, output_dir)
+
+
+# --------------------------------------------------------------------------- #
+# 内网 OCR 探活
+# --------------------------------------------------------------------------- #
+class OcrProbe:
+    """定时探测内网 OCR 服务端口，连续失败 / 恢复各发一次告警。"""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        interval: float,
+        failures_to_alert: int = 2,
+        repeat_after: float = 3600.0,
+        maintenance: Sequence[tuple[int, int]] = (),
+        mail: email_alert.MailConfig | None = None,
+        timeout: float = 5.0,
+    ) -> None:
+        self.url = url
+        self.interval = float(interval)
+        self.failures_to_alert = max(1, int(failures_to_alert))
+        self.repeat_after = max(0.0, float(repeat_after))
+        self.maintenance = tuple(maintenance)
+        self.mail = mail
+        self.timeout = timeout
+        self.host, self.port = self._endpoint(url)
+        self._last_probe = 0.0
+        self._consecutive_failures = 0
+        self._last_alert_at = 0.0
+        self._down = False
+
+    @staticmethod
+    def _endpoint(url: str) -> tuple[str, int]:
+        parts = urlsplit(url if "//" in url else f"//{url}")
+        host = parts.hostname or ""
+        if parts.port:
+            port = parts.port
+        else:
+            port = 443 if parts.scheme == "https" else 80
+        return host, port
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.host and self.port)
+
+    def probe_once(self) -> tuple[bool, str]:
+        if not self.enabled:
+            return False, f"无法从 {self.url!r} 解析出主机端口"
+        try:
+            with socket.create_connection((self.host, self.port), timeout=self.timeout):
+                return True, ""
+        except (OSError, socket.timeout) as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def maybe_probe(self, now: float | None = None) -> None:
+        """到了探测间隔就探一次；本函数不会抛异常。"""
+        stamp = time.monotonic() if now is None else now
+        if stamp - self._last_probe < self.interval:
+            return
+        self._last_probe = stamp
+        ok, detail = self.probe_once()
+
+        if ok:
+            if self._down:
+                LOGGER.info("内网 OCR 服务已恢复：%s", self.url)
+                email_alert.notify_ocr_probe(
+                    url=self.url,
+                    host=self.host,
+                    port=self.port,
+                    down=False,
+                    config=self.mail,
+                )
+            self._down = False
+            self._consecutive_failures = 0
+            self._last_alert_at = 0.0
+            return
+
+        self._consecutive_failures += 1
+        in_window = in_maintenance_window(self.maintenance)
+        LOGGER.warning(
+            "内网 OCR 探活失败（连续 %d 次，%s）%s",
+            self._consecutive_failures,
+            detail,
+            "；当前在停机窗口内，不发告警" if in_window else "",
+        )
+        if in_window:
+            # 停机窗口内不算故障，并且清掉已告警标记，
+            # 这样窗口结束后若还没恢复会立刻再报一次。
+            self._down = False
+            self._last_alert_at = 0.0
+            return
+        if self._consecutive_failures < self.failures_to_alert:
+            return
+        if self._last_alert_at and stamp - self._last_alert_at < self.repeat_after:
+            return
+        self._last_alert_at = stamp
+        self._down = True
+        email_alert.notify_ocr_probe(
+            url=self.url,
+            host=self.host,
+            port=self.port,
+            down=True,
+            consecutive=self._consecutive_failures,
+            detail=detail,
+            config=self.mail,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 产物审计
+# --------------------------------------------------------------------------- #
+def _is_blank(value: Any) -> bool:
+    text = "" if value is None else str(value).strip()
+    return text.lower() in _BLANK_TOKENS
+
+
+def audit_chunk_output(
+    chunk_result: dict[str, Any], *, core_fields: Sequence[str] = CORE_METRIC_FIELDS, min_fields: int = 1
+) -> dict[str, Any]:
+    """读一个批次块产出的 ``result.csv``，统计行数与「核心字段全空」的商品。
+
+    直接读交付物本身（而不是读内存里的 document），这样「写了但没落盘」
+    这类问题也能被发现。本函数不会抛异常。
+    """
+    csv_path = Path(str(chunk_result.get("csv") or ""))
+    report: dict[str, Any] = {
+        "run_id": str(chunk_result.get("run_id") or ""),
+        "output_dir": str(chunk_result.get("output_dir") or ""),
+        "csv": str(csv_path) if str(chunk_result.get("csv") or "") else "",
+        "csv_ok": False,
+        "rows": 0,
+        "empties": [],
+    }
+    if not report["csv"] or not csv_path.is_file():
+        if report["csv"]:
+            LOGGER.error("批次块产物缺失：%s 不存在", report["csv"])
+        else:
+            LOGGER.error("批次块 %s 的结果里没有 csv 字段", report["run_id"] or "?")
+        return report
+
+    try:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            headers = [name for name in (reader.fieldnames or []) if name]
+            present = [name for name in core_fields if name in headers]
+            missing_columns = [name for name in core_fields if name not in headers]
+            if missing_columns:
+                LOGGER.warning(
+                    "CSV %s 缺少核心列 %s，这些列不参与空值判定",
+                    csv_path.name,
+                    "、".join(missing_columns),
+                )
+            for row in reader:
+                report["rows"] += 1
+                product_id = str(row.get("product_id") or "").strip() or f"第{report['rows']}行"
+                filled = [name for name in present if not _is_blank(row.get(name))]
+                if len(filled) >= max(0, min_fields):
+                    continue
+                if filled:
+                    note = f"只识别出 {len(filled)} 个核心字段（{'、'.join(filled)}）"
+                else:
+                    note = "核心字段全部为空"
+                report["empties"].append({"product_id": product_id, "note": note})
+    except (OSError, csv.Error, UnicodeDecodeError) as exc:
+        LOGGER.error("读取 %s 失败：%s", csv_path, exc)
+        return report
+
+    report["csv_ok"] = True
+    return report
 
 
 # --------------------------------------------------------------------------- #
@@ -306,7 +696,7 @@ def discover_batches(input_root: Path) -> list[Path]:
 
 
 def plan_chunks(products: list[Path], chunk_size: int) -> list[list[Path]]:
-    size = max(1, min(chunk_size, demo.MAX_PRODUCTS))
+    size = max(1, min(chunk_size, MAX_CHUNK_SIZE))
     return [products[index:index + size] for index in range(0, len(products), size)]
 
 
@@ -398,7 +788,7 @@ def run_one_batch(
         batch_key,
         len(products),
         len(chunks),
-        min(options.chunk_size, demo.MAX_PRODUCTS),
+        min(options.chunk_size, MAX_CHUNK_SIZE),
     )
     if options.dry_run:
         return (
@@ -418,7 +808,7 @@ def run_one_batch(
     ocr_totals = {"planned_images": 0, "success_images": 0, "failed_images": 0, "cache_hits": 0}
     last_output_dir = batch_output_root
     for index, chunk in enumerate(chunks, start=1):
-        manifest = demo.build_manifest(batch_dir, chunk, options.platform)
+        manifest = demo.build_manifest(batch_dir, chunk, options.platform, allow_many=True)
         if config is None:
             # 只构造一次，后续批次块复用（凭据、地址、schema 都与商品无关）。
             config = build_pipeline_config(manifest, options)
@@ -456,6 +846,32 @@ def run_one_batch(
         overall = "complete"
     else:
         overall = "review"
+
+    # ---- 产物审计：CSV 有没有落盘、有没有数据、有没有商品全空 ----
+    min_fields = email_alert.empty_product_min_fields()
+    audits = [audit_chunk_output(item, min_fields=min_fields) for item in documents]
+    csv_files = [audit["csv"] for audit in audits if audit["csv_ok"]]
+    csv_missing = [
+        f"第 {index}/{len(chunks)} 块（run {audit['run_id'] or '?'}）："
+        f"{audit['csv'] or '结果里没有 csv 路径'}（输出目录 {audit['output_dir'] or '-'}）"
+        for index, audit in enumerate(audits, start=1)
+        if not audit["csv_ok"]
+    ]
+    csv_rows = sum(int(audit["rows"]) for audit in audits)
+    empty_products = [
+        {
+            "product_id": item["product_id"],
+            "note": item["note"],
+            "best_run_id": audit["run_id"],
+        }
+        for audit in audits
+        for item in audit["empties"]
+    ]
+    if csv_missing:
+        LOGGER.error("批次 %s 有 %d 个批次块没产出 CSV", batch_key, len(csv_missing))
+    if empty_products:
+        LOGGER.warning("批次 %s 有 %d 个商品核心字段全空", batch_key, len(empty_products))
+
     return (
         {
             "status": overall,
@@ -464,6 +880,11 @@ def run_one_batch(
             "output_dir": str(last_output_dir),
             "success_count": success,
             "review_count": review,
+            "product_count": len(products),
+            "csv_files": csv_files,
+            "csv_missing": csv_missing,
+            "csv_rows": csv_rows,
+            "empty_products": empty_products,
             "workbook": next(
                 (item.get("workbook") for item in reversed(documents) if item.get("workbook")), None
             ),
@@ -495,6 +916,7 @@ def process_cycle(
     stopper: StopController,
     *,
     config_holder: dict[str, Any],
+    watchdog: ProgressWatchdog | None = None,
 ) -> dict[str, int]:
     """扫描一轮收件目录并处理需要跑的批次。"""
     stats = {"scanned": 0, "ran": 0, "skipped": 0, "failed": 0, "paused": False}
@@ -549,16 +971,36 @@ def process_cycle(
         record.status = "running"
         ledger.save()
         started = time.time()
+        if watchdog is not None:
+            watchdog.begin_batch(batch_key, options.output_root / batch_key)
         try:
             result, config_holder["config"] = run_one_batch(
                 batch_dir, options, config=config_holder.get("config")
             )
         except KeyboardInterrupt:
+            if watchdog is not None:
+                watchdog.end_batch()
             record.status = "interrupted"
             record.last_error = "收到中断信号"
             ledger.save()
+            LOGGER.warning("批次 %s 被中断，产物已落盘，可断点续跑", batch_key)
+            email_alert.notify_daemon_stopped(
+                reason=f"批次 {batch_key} 运行中被中断，服务即将退出",
+                severity="error",
+                batch_label=batch_key,
+                batch_status="interrupted",
+                output_dir=Path(
+                    str(
+                        (config_holder.get("config") or {}).get("run_output_dir")
+                        or (options.output_root / batch_key)
+                    )
+                ),
+                config=options.mail,
+            )
             raise
         except demo.DemoError as exc:
+            if watchdog is not None:
+                watchdog.end_batch()
             code = str(getattr(exc, "code", "DEMO_ERROR"))
             message = demo.safe_message(exc)
             record.status = "interrupted" if code in RETRYABLE_ERROR_CODES else "failed"
@@ -587,6 +1029,8 @@ def process_cycle(
                 continue
             continue
         except Exception as exc:  # noqa: BLE001 - 守护进程必须活下来
+            if watchdog is not None:
+                watchdog.end_batch()
             record.status = "failed"
             record.last_error = f"未处理异常: {exc}"
             ledger.save()
@@ -602,6 +1046,8 @@ def process_cycle(
             continue
 
         elapsed = time.time() - started
+        if watchdog is not None:
+            watchdog.end_batch()
         record.status = str(result.get("status") or "failed")
         record.run_id = str(result.get("run_id") or "")
         record.success = int(result.get("success_count") or 0)
@@ -621,6 +1067,24 @@ def process_cycle(
         if options.dry_run:
             LOGGER.info("dry-run 模式：不发邮件")
             continue
+        # 用户点名的两类报警：结果文件没生成、商品什么都没识别出来。
+        # 这两类各发一封独立邮件（汇总邮件正文里只留摘要，避免重复）。
+        if result.get("csv_missing"):
+            email_alert.notify_artifacts_missing(
+                batch_label=batch_key,
+                missing=result["csv_missing"],
+                expected=len(result.get("chunks") or []),
+                output_dir=Path(str(result.get("output_dir") or record.path)),
+                config=options.mail,
+            )
+        if result.get("empty_products"):
+            email_alert.notify_products_empty(
+                batch_label=batch_key,
+                empty_products=result["empty_products"],
+                total_products=int(result.get("product_count") or 0),
+                output_dir=Path(str(result.get("output_dir") or record.path)),
+                config=options.mail,
+            )
         email_alert.notify_pipeline_result(result, batch_label=batch_key, config=options.mail)
     return stats
 
@@ -659,7 +1123,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--bulk-first-pass", action="store_true", help="跳过联网搜索，只跑 OCR + 数据库")
     parser.add_argument(
-        "--chunk-size", type=int, default=demo.MAX_PRODUCTS, help=f"每个批次块最多几个商品（上限 {demo.MAX_PRODUCTS}）"
+        "--chunk-size",
+        type=int,
+        default=_env_int("OCR_CHUNK_SIZE", DEFAULT_CHUNK_SIZE),
+        help=f"每个批次块最多几个商品（上限 {MAX_CHUNK_SIZE}），默认 {DEFAULT_CHUNK_SIZE}",
+    )
+    parser.add_argument(
+        "--stuck-minutes",
+        type=float,
+        default=_env_float("OCR_STUCK_MINUTES", 30.0),
+        help="批次连续多少分钟没有进度就发一次「疑似卡住」告警，默认 30",
+    )
+    parser.add_argument("--no-stuck-alert", action="store_true", help="关闭「卡住」看门狗")
+    parser.add_argument(
+        "--ocr-probe-url",
+        default=os.environ.get("PADDLE_OCR_API_URL", ""),
+        help="内网 OCR 服务地址（探活用），默认取 PADDLE_OCR_API_URL",
+    )
+    parser.add_argument(
+        "--ocr-probe-interval",
+        type=float,
+        default=_env_float("OCR_PROBE_INTERVAL", 600.0),
+        help="OCR 探活间隔秒数，默认 600",
+    )
+    parser.add_argument(
+        "--ocr-probe-failures",
+        type=int,
+        default=_env_int("OCR_PROBE_FAILURES", 2),
+        help="连续失败几次才告警，默认 2",
+    )
+    parser.add_argument(
+        "--ocr-probe-repeat",
+        type=float,
+        default=_env_float("OCR_PROBE_REPEAT", 3600.0),
+        help="服务持续不可达时多少秒后重复提醒一次，默认 3600",
+    )
+    parser.add_argument("--no-ocr-probe", action="store_true", help="关闭内网 OCR 探活")
+    parser.add_argument(
+        "--maintenance-window",
+        default=os.environ.get("ALERT_OCR_MAINTENANCE_WINDOWS", ""),
+        help="OCR 停机窗口，如 14:00-18:00（多个用逗号分隔）；窗口内探活失败不告警",
     )
     parser.add_argument("--pid-file", default="", help="PID 文件路径，默认 <state-dir>/daemon/ocr-daemon.pid")
     parser.add_argument("--log-file", default="", help="日志文件路径，默认 <state-dir>/daemon/ocr-daemon.log")
@@ -673,7 +1176,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     pid_file = Path(args.pid_file).resolve() if args.pid_file else daemon_dir / "ocr-daemon.pid"
     log_file = Path(args.log_file).resolve() if args.log_file else daemon_dir / "ocr-daemon.log"
 
-    configure_logging(log_file, verbose=args.verbose)
+    mail = email_alert.mail_config()
+    maintenance = parse_maintenance_windows(args.maintenance_window)
+
+    watchdog: ProgressWatchdog | None = None
+    if not args.no_stuck_alert and args.stuck_minutes > 0:
+        # 下限 60 秒：再短会把正常的 OCR 慢请求误判成卡住。
+        stuck_seconds = max(60.0, args.stuck_minutes * 60)
+        watchdog = ProgressWatchdog(
+            stuck_seconds,
+            # 检查频率跟着超时走，但夹在 10s ~ 60s 之间，别把 CPU 空转掉。
+            interval=max(10.0, min(60.0, stuck_seconds / 10)),
+            notify_fn=lambda label, minutes, last, out: email_alert.notify_stuck(
+                batch_label=label,
+                stuck_minutes=minutes,
+                last_progress=last,
+                output_dir=out,
+                config=mail,
+            ),
+            mail=mail,
+        )
+
+    configure_logging(log_file, verbose=args.verbose, watchdog=watchdog)
 
     if not args.platform.strip():
         LOGGER.critical("必须通过 --platform 或 OCR_DEMO_PLATFORM 指定数据库平台标识")
@@ -684,8 +1208,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     input_root = Path(args.input_root).resolve()
 
-    mail = email_alert.mail_config()
     LOGGER.info("邮件报警配置：%s", mail.summary())
+    if maintenance:
+        LOGGER.info("OCR 停机窗口：%s（窗口内探活失败不告警）", _describe_windows(maintenance))
+    else:
+        LOGGER.info("OCR 停机窗口：未配置（探活失败就会告警）")
+    if watchdog is not None:
+        LOGGER.info("卡住看门狗：连续 %.0f 分钟没有进度输出则告警一次", args.stuck_minutes)
     if args.dry_run:
         # dry-run 不碰任何外部服务，也不该因为缺密钥就报错，更不该发告警邮件。
         LOGGER.info("dry-run 模式：跳过凭据与服务预检")
@@ -718,6 +1247,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     ledger = BatchLedger(daemon_dir / "ledger.json")
     config_holder: dict[str, Any] = {}
 
+    # 上次进程被 kill -9 / 机器断电时，台账里的批次会停在 running。
+    # 死掉的进程发不出邮件，所以只能在这一轮启动时补报一次。
+    unfinished = [record for record in ledger.records.values() if record.status == "running"]
+
+    probe: OcrProbe | None = None
+    # 下限 10 秒：探活本身只是一次 TCP 连接，太频繁没意义还容易误判。
+    probe_interval = max(10.0, args.ocr_probe_interval)
+    if args.no_ocr_probe:
+        LOGGER.info("OCR 探活：已通过 --no-ocr-probe 关闭")
+    elif not args.ocr_probe_url.strip():
+        LOGGER.info("OCR 探活：未配置 PADDLE_OCR_API_URL，跳过")
+    else:
+        probe = OcrProbe(
+            args.ocr_probe_url.strip(),
+            interval=probe_interval,
+            failures_to_alert=args.ocr_probe_failures,
+            repeat_after=args.ocr_probe_repeat,
+            maintenance=maintenance,
+            mail=mail,
+        )
+        if probe.enabled:
+            LOGGER.info(
+                "OCR 探活：%s:%d 每 %s 秒一次，连续失败 %d 次告警",
+                probe.host,
+                probe.port,
+                int(probe_interval),
+                args.ocr_probe_failures,
+            )
+        else:
+            LOGGER.warning("无法从 %r 解析出主机端口，OCR 探活已关闭", args.ocr_probe_url)
+            probe = None
+
     try:
         acquire_pid_file(pid_file)
     except AlreadyRunning as exc:
@@ -732,6 +1293,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         "dry-run" if args.dry_run else ("单轮" if args.once else f"常驻 {args.interval}s"),
     )
     if not args.dry_run:
+        if unfinished:
+            email_alert.notify(
+                "发现上次运行没有正常收尾",
+                [
+                    f"有 {len(unfinished)} 个批次停在 running 状态，说明上次的进程是被"
+                    "强杀（kill -9 / OOM / 断电）而不是正常退出的。",
+                    "这些批次会自动重跑；已完成的图片有缓存，不会重复付费。",
+                    "",
+                    "—— 明细（最多 10 条）——",
+                    *[
+                        f"  {record.batch_key}：第 {record.attempts} 次尝试，"
+                        f"run={record.run_id or '-'}，目录 {record.path}"
+                        for record in unfinished[:10]
+                    ],
+                ],
+                severity="warning",
+                config=mail,
+            )
+            # 报过一次就改成 interrupted，避免 systemd 反复重启时每轮都刷一封。
+            for record in unfinished:
+                record.status = "interrupted"
+                record.last_error = record.last_error or "上次进程未正常退出"
+            ledger.save()
         email_alert.notify(
             "后台服务已启动",
             [
@@ -739,16 +1323,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"平台标识：{options.platform}",
                 f"输出目录：{output_root}",
                 f"轮询模式：{'单轮' if args.once else f'每 {args.interval} 秒'}",
+                f"单块商品数上限：{min(options.chunk_size, MAX_CHUNK_SIZE)}",
+                f"卡住告警：{'关闭' if watchdog is None else f'{args.stuck_minutes:.0f} 分钟无进度'}",
+                f"OCR 探活：{'关闭' if probe is None else f'{probe.host}:{probe.port} 每 {int(probe_interval)} 秒'}",
+                f"OCR 停机窗口：{_describe_windows(maintenance) or '未配置'}",
             ],
             severity="info",
             config=mail,
         )
 
+    if watchdog is not None:
+        watchdog.start()
+
     exit_code = 0
+    stop_reason = ""
     try:
         while True:
+            if probe is not None:
+                probe.maybe_probe()
             try:
-                stats = process_cycle(options, ledger, stopper, config_holder=config_holder)
+                stats = process_cycle(
+                    options, ledger, stopper, config_holder=config_holder, watchdog=watchdog
+                )
             except KeyboardInterrupt:
                 LOGGER.warning("收到中断，退出")
                 raise
@@ -760,18 +1356,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 exit_code = 1 if stats.get("failed") else 0
                 break
             if stopper.requested:
+                stop_reason = "收到停止信号，当前批次已跑完，服务正常退出"
                 break
             wait = options.retryable_backoff if stats.get("paused") else args.interval
             LOGGER.info("本轮结束 %s，%s 秒后进入下一轮", stats, int(wait))
             if not stopper.sleep(wait):
+                stop_reason = "收到停止信号，服务在轮询间隙退出"
                 break
     except KeyboardInterrupt:
         LOGGER.warning("守护进程被中断退出")
         exit_code = 130
+        stop_reason = "收到第二次中断信号（SIGINT/SIGTERM），立即退出，可能有批次未收尾"
     finally:
+        if watchdog is not None:
+            watchdog.stop()
         release_pid_file(pid_file)
         ledger.save()
         LOGGER.info("守护进程已退出：pid=%s", os.getpid())
+        # 单轮模式不报「服务已退出」，那只是跑一遍就结束，不是异常。
+        if stop_reason and not args.once and not args.dry_run:
+            email_alert.notify_daemon_stopped(
+                reason=stop_reason,
+                severity="info" if exit_code == 0 else "error",
+                config=mail,
+            )
     return exit_code
 
 

@@ -185,7 +185,67 @@ for f in deploy/*.sh; do tr -d '\r' < "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done
 .venv/bin/python ocr_daemon.py --input-root /data/ocr/inbox --platform jd --dry-run --once
 ```
 
-常用参数：`--interval`（轮询间隔）、`--error-backoff`（服务中断后的退避秒数）、`--max-attempts`（单批次最大尝试次数）、`--no-retry-review`（待复核批次不自动重试）、`--chunk-size`（每块商品数上限）、`--ocr-workers`。
+常用参数：`--interval`（轮询间隔）、`--error-backoff`（服务中断后的退避秒数）、`--max-attempts`（单批次最大尝试次数）、`--no-retry-review`（待复核批次不自动重试）、`--ocr-workers`，以及下面这些告警相关开关（都有对应的环境变量，写进 env 文件即可）：
+
+| 参数 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `--chunk-size` | `OCR_CHUNK_SIZE` | `500` | 一个批次块最多几个商品（上限 500）。500 就是「一次收 500 条、一次跑完、出一个结果文件」 |
+| `--stuck-minutes` | `OCR_STUCK_MINUTES` | `30` | 连续多少分钟没有进度输出就告警 |
+| `--no-stuck-alert` | — | 关 | 关掉卡住看门狗 |
+| `--ocr-probe-url` | `PADDLE_OCR_API_URL` | 空 | 探活目标；默认取 OCR 地址 |
+| `--ocr-probe-interval` | `OCR_PROBE_INTERVAL` | `600` | 探活间隔秒数 |
+| `--ocr-probe-failures` | `OCR_PROBE_FAILURES` | `2` | 连续失败几次才告警 |
+| `--ocr-probe-repeat` | `OCR_PROBE_REPEAT` | `3600` | 持续不可达时重复提醒的间隔 |
+| `--no-ocr-probe` | — | 关 | 关掉探活 |
+| `--maintenance-window` | `ALERT_OCR_MAINTENANCE_WINDOWS` | 空 | OCR 停机窗口，如 `14:00-18:00`；窗口内探活失败不告警 |
+
+### 怎么看跑得怎么样
+
+从粗到细四个地方：
+
+**1）台账 —— 一眼看全部批次的状态**
+
+```bash
+sudo cat /var/lib/ocr-v7/state/daemon/ledger.json
+```
+
+每个批次一条记录：`status`（`pending` / `running` / `complete` / `review` / `failed` / `interrupted`）、
+`attempts`、`run_id`、`success`、`review`、`finished_at`、`last_error`。
+
+**2）实时日志**
+
+```bash
+journalctl -u ocr-v7-daemon -f                                    # 跟着看
+journalctl -u ocr-v7-daemon --since "2 hours ago" | grep '\[pipeline\]'
+sudo tail -f /var/lib/ocr-v7/state/daemon/ocr-daemon.log           # 日志文件
+```
+
+带 `[pipeline]` 前缀的是 demo.py 的进度（OCR 第 N/M 张、Qwen 阶段、导出阶段），
+看门狗的「还活着」心跳也是从这里取的。
+
+**3）产物目录**
+
+```bash
+ls -lt /var/lib/ocr-v7/runs/<批次名>/
+```
+
+每跑一次生成一个 `<时间戳-运行ID>/`，里面有：
+
+| 文件 | 内容 |
+|---|---|
+| `result.xlsx` | 交付用的 Excel（31 列） |
+| `result.csv` | 同内容 CSV |
+| `report.html` | 单次运行报告，打开就能看成功率、耗时分布、告警清单 |
+| `performance.json` | 性能明细：各阶段耗时、OCR P50/P95、缓存命中 |
+| `待复核图片.json` | 需要人工看的图片清单 + 错误码 |
+| `products/<product_id>.json` | 单个商品的完整字段与 `source_evidence`（字段到底从哪来的） |
+
+**4）服务本身还活着吗**
+
+```bash
+sudo systemctl status ocr-v7-daemon
+sudo cat /var/lib/ocr-v7/state/daemon/ocr-daemon.pid
+```
 
 ### 邮件报警
 
@@ -202,18 +262,37 @@ for f in deploy/*.sh; do tr -d '\r' < "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done
 | `ALERT_MAIL_TO` | `13306032298@163.com` | 收件人，多个用逗号分隔 |
 | `ALERT_ON_SUCCESS` | `1` | 运行成功时是否也发汇总邮件；设 `0` 只收告警 |
 | `ALERT_ATTACH_ARTIFACTS` | `1` | 附上 `performance.json` 和 `待复核图片.json`（单文件上限 2 MB） |
+| `ALERT_EMPTY_PRODUCT_MIN_FIELDS` | `1` | 一个商品核心字段里非空少于几个算「没识别出来」 |
+| `ALERT_OCR_MAINTENANCE_WINDOWS` | 空 | OCR 停机窗口，如 `14:00-18:00`；窗口内探活失败不告警 |
 
-会触发邮件的四类事件：
+想先看看邮件长什么样（**不发信**，OCR 不在线也能跑）：
 
-| 主题标签 | 触发条件 |
-|---|---|
-| `【运行信息】` | 服务启动、邮件自检 |
-| `【运行成功】` | 批次全部商品 `success`（受 `ALERT_ON_SUCCESS` 控制） |
-| `【待复核】` | 批次状态为 `review`，邮件里列出待复核图片（最多 20 条） |
-| `【运行失败】` | 批次抛错，邮件带错误码、说明和排查建议；可重试的还会注明重试倒计时 |
-| `【严重故障】` | 启动时环境变量/安全项缺失 |
+```bash
+.venv/bin/python email_alert.py --preview      # 打印全部 10 种报警邮件正文
+.venv/bin/python email_alert.py --self-test    # 真的发一封测试邮件
+```
 
-邮件正文含商品成功/待复核数量、总耗时、OCR P50/P95、缓存命中数与输出目录。**报警是旁路：SMTP 连不上只写日志，不会影响 OCR 主管线。**
+会触发邮件的事件：
+
+| 主题标签 | 触发条件 | 时机 |
+|---|---|---|
+| `【严重故障】` | 启动时缺环境变量 / 安全确认项 | 启动即发 |
+| `【运行信息】` | 服务启动、优雅停止、OCR 探活恢复 | 即时 |
+| `【运行成功】` | 批次全部商品 `success`，且没有下面的异常 | 批次结束 |
+| `【待复核】` | 有商品待复核，或**有商品核心字段全空**，或**批次疑似卡住** | 批次结束 / 即时 |
+| `【运行失败】` | 批次抛错、**没生成 CSV**、OCR 探活连续失败、服务被强制中断 | 即时或批次结束 |
+
+逐条对照「什么情况会收到邮件」：
+
+| 情况 | 会不会发 | 具体行为 |
+|---|---|---|
+| **OCR 服务断了** | ✅ | ① 批次跑到一半断：立刻发 `【运行失败】批次运行失败（PADDLE_OCR_INTERRUPTED）`，正文注明多少秒后自动重试；② 空闲期断：探活线程连续 2 次连不上就发「内网 OCR 服务不可达」。**停机窗口内不报**（`ALERT_OCR_MAINTENANCE_WINDOWS`），窗口结束后仍未恢复才报；恢复时补发一封「已恢复」 |
+| **程序被中断** | ✅ | ① 优雅停止（`systemctl stop`）：`【运行信息】后台服务已退出`；② 被第二次信号或异常打断：`【运行失败】`，并注明批次未收尾；③ 被 `kill -9` / OOM / 断电（进程本身发不出邮件）：下次启动时发「发现上次运行没有正常收尾」，列出停在 `running` 的批次 |
+| **没识别出 CSV** | ✅ | 批次结束后逐个检查 `result.csv` 是否存在、行数是否够。缺文件发 `【运行失败】批次没有产出结果文件`；行数少于商品数会在汇总邮件里用 `!!` 标出 |
+| **一个物品什么都没识别出来** | ✅ | 批次结束后逐行读 `result.csv`，17 个核心字段（规格/包装/规格总量/最小单位价格/是否多规格/日服量/最小·最大日服量/最小·最大日服成本/成分/人群/功能/品牌/剂型/蓝帽标识/代工厂）全空就发「有商品完全没识别出来」，列出 product_id 与排查建议 |
+| **堵塞过久** | ✅ | 看门狗盯着 `demo.progress` 心跳，连续 `OCR_STUCK_MINUTES`（默认 30）分钟没有进度就发「批次疑似卡住」，**只发一次**；之后一旦有新进度会重置计时，再卡住还能再报 |
+
+邮件正文含商品成功/待复核数量、CSV 行数、总耗时、OCR P50/P95、缓存命中数与输出目录。**报警是旁路：SMTP 连不上只写日志，不会影响 OCR 主管线。**
 
 ### 批次台账与重试语义
 

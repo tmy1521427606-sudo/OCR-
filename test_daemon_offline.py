@@ -15,10 +15,13 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import tempfile
+import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -85,7 +88,15 @@ class PlanChunksTest(unittest.TestCase):
     def test_chunk_size_over_limit_is_clamped(self) -> None:
         products = [Path(f"p{index}") for index in range(150)]
         chunks = ocr_daemon.plan_chunks(products, 9999)
-        self.assertTrue(all(len(chunk) <= demo.MAX_PRODUCTS for chunk in chunks))
+        self.assertTrue(all(len(chunk) <= ocr_daemon.MAX_CHUNK_SIZE for chunk in chunks))
+
+    def test_daemon_allows_more_than_demo_interactive_limit(self) -> None:
+        """服务端没人交互，单块可以超过 demo.MAX_PRODUCTS(100)，上限是 MAX_CHUNK_SIZE。"""
+        products = [Path(f"p{index}") for index in range(500)]
+        chunks = ocr_daemon.plan_chunks(products, ocr_daemon.DEFAULT_CHUNK_SIZE)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(len(chunks[0]), 500)
+        self.assertGreater(ocr_daemon.MAX_CHUNK_SIZE, demo.MAX_PRODUCTS)
 
 
 class DiscoverBatchesTest(unittest.TestCase):
@@ -564,6 +575,340 @@ class PipelineResultMailTest(unittest.TestCase):
                 )
         self.assertFalse(sent)
         patched.assert_not_called()
+
+
+class MaintenanceWindowTest(unittest.TestCase):
+    """内网 OCR 每天定时关停，窗口内探活失败不该告警。"""
+
+    def test_parses_multiple_windows(self) -> None:
+        windows = ocr_daemon.parse_maintenance_windows("14:00-18:00, 02:00-02:30")
+        self.assertEqual(windows, ((14 * 60, 18 * 60), (2 * 60, 2 * 60 + 30)))
+
+    def test_garbage_is_ignored_without_raising(self) -> None:
+        self.assertEqual(ocr_daemon.parse_maintenance_windows("随便写点啥"), ())
+        self.assertEqual(ocr_daemon.parse_maintenance_windows("25:00-26:00"), ())
+        self.assertEqual(ocr_daemon.parse_maintenance_windows(""), ())
+
+    def test_inside_and_outside(self) -> None:
+        windows = ocr_daemon.parse_maintenance_windows("14:00-18:00")
+        self.assertTrue(
+            ocr_daemon.in_maintenance_window(windows, datetime(2026, 9, 20, 14, 30))
+        )
+        self.assertFalse(ocr_daemon.in_maintenance_window(windows, datetime(2026, 9, 20, 18, 0)))
+        self.assertFalse(ocr_daemon.in_maintenance_window(windows, datetime(2026, 9, 20, 13, 59)))
+
+    def test_window_crossing_midnight(self) -> None:
+        windows = ocr_daemon.parse_maintenance_windows("23:30-01:00")
+        self.assertTrue(ocr_daemon.in_maintenance_window(windows, datetime(2026, 9, 20, 23, 45)))
+        self.assertTrue(ocr_daemon.in_maintenance_window(windows, datetime(2026, 9, 20, 0, 30)))
+        self.assertFalse(ocr_daemon.in_maintenance_window(windows, datetime(2026, 9, 20, 2, 0)))
+
+    def test_no_window_configured(self) -> None:
+        self.assertFalse(ocr_daemon.in_maintenance_window((), datetime(2026, 9, 20, 14, 30)))
+
+
+class AuditChunkOutputTest(unittest.TestCase):
+    """「没识别出 CSV」和「商品什么都没识别出来」两类报警的判定逻辑。"""
+
+    def _write_csv(self, directory: Path, rows: list[dict[str, str]]) -> Path:
+        path = directory / "result.csv"
+        fields = ["product_id", *ocr_daemon.CORE_METRIC_FIELDS]
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        return path
+
+    def test_flags_rows_whose_core_fields_are_all_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            path = self._write_csv(
+                directory,
+                [
+                    {"product_id": "1001", "规格": "60粒", "包装": "1瓶"},
+                    {"product_id": "1002"},
+                    # 导出时空 list/dict 会被 json.dumps 成 "[]" / "{}"，也算空
+                    {"product_id": "1003", "规格": "[]", "包装": "{}"},
+                ],
+            )
+            report = ocr_daemon.audit_chunk_output(
+                {"csv": str(path), "run_id": "run-1", "output_dir": tmp}
+            )
+        self.assertTrue(report["csv_ok"])
+        self.assertEqual(report["rows"], 3)
+        self.assertEqual([item["product_id"] for item in report["empties"]], ["1002", "1003"])
+        self.assertEqual(report["empties"][0]["note"], "核心字段全部为空")
+
+    def test_partially_filled_row_is_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            path = self._write_csv(directory, [{"product_id": "1001", "品牌": "养生堂"}])
+            report = ocr_daemon.audit_chunk_output({"csv": str(path), "run_id": "r"})
+        self.assertEqual(report["empties"], [])
+
+    def test_min_fields_threshold_is_configurable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            path = self._write_csv(directory, [{"product_id": "1001", "品牌": "养生堂"}])
+            report = ocr_daemon.audit_chunk_output({"csv": str(path), "run_id": "r"}, min_fields=2)
+        self.assertEqual(len(report["empties"]), 1)
+        self.assertIn("品牌", report["empties"][0]["note"])
+
+    def test_missing_csv_is_reported_not_raised(self) -> None:
+        report = ocr_daemon.audit_chunk_output(
+            {"csv": "/nonexistent/result.csv", "run_id": "run-1"}
+        )
+        self.assertFalse(report["csv_ok"])
+        self.assertEqual(report["rows"], 0)
+
+    def test_result_without_csv_path_is_reported(self) -> None:
+        report = ocr_daemon.audit_chunk_output({"run_id": "run-1", "output_dir": "/x"})
+        self.assertFalse(report["csv_ok"])
+        self.assertEqual(report["csv"], "")
+
+    def test_empty_product_min_fields_env(self) -> None:
+        with mock.patch.dict(os.environ, {"ALERT_EMPTY_PRODUCT_MIN_FIELDS": "3"}, clear=True):
+            self.assertEqual(email_alert.empty_product_min_fields(), 3)
+        with mock.patch.dict(os.environ, {"ALERT_EMPTY_PRODUCT_MIN_FIELDS": "nope"}, clear=True):
+            self.assertEqual(email_alert.empty_product_min_fields(), 1)
+
+
+class OcrProbeTest(unittest.TestCase):
+    def _make(self, **kwargs) -> "ocr_daemon.OcrProbe":
+        options = {
+            "interval": 30.0,
+            "failures_to_alert": 2,
+            "repeat_after": 3600.0,
+        }
+        options.update(kwargs)
+        return ocr_daemon.OcrProbe("http://192.168.1.115:8870/v1/ocr", **options)
+
+    def test_endpoint_parsing(self) -> None:
+        self.assertEqual(
+            ocr_daemon.OcrProbe._endpoint("http://192.168.1.115:8870/v1/ocr"),
+            ("192.168.1.115", 8870),
+        )
+        self.assertEqual(
+            ocr_daemon.OcrProbe._endpoint("https://ocr.internal/v1"), ("ocr.internal", 443)
+        )
+        self.assertEqual(
+            ocr_daemon.OcrProbe._endpoint("192.168.0.9:9999"), ("192.168.0.9", 9999)
+        )
+
+    def test_alerts_only_after_threshold(self) -> None:
+        probe = self._make()
+        with mock.patch.object(probe, "probe_once", return_value=(False, "refused")):
+            with mock.patch.object(email_alert, "notify_ocr_probe") as notify:
+                probe.maybe_probe(now=30.0)
+                self.assertEqual(notify.call_count, 0, "第一次失败不该报警")
+                probe.maybe_probe(now=60.0)
+                self.assertEqual(notify.call_count, 1)
+                probe.maybe_probe(now=90.0)
+                self.assertEqual(notify.call_count, 1, "未到重复提醒间隔，不该刷屏")
+
+    def test_maintenance_window_suppresses_alert(self) -> None:
+        probe = self._make()
+        with mock.patch.object(probe, "probe_once", return_value=(False, "refused")):
+            with mock.patch.object(ocr_daemon, "in_maintenance_window", return_value=True):
+                with mock.patch.object(email_alert, "notify_ocr_probe") as notify:
+                    probe.maybe_probe(now=30.0)
+                    probe.maybe_probe(now=60.0)
+                    probe.maybe_probe(now=90.0)
+        notify.assert_not_called()
+
+    def test_recovery_sends_info_after_alert(self) -> None:
+        probe = self._make()
+        with mock.patch.object(probe, "probe_once") as one:
+            with mock.patch.object(email_alert, "notify_ocr_probe") as notify:
+                one.return_value = (False, "refused")
+                probe.maybe_probe(now=30.0)
+                probe.maybe_probe(now=60.0)
+                self.assertEqual(notify.call_count, 1)
+                one.return_value = (True, "")
+                probe.maybe_probe(now=90.0)
+        self.assertEqual(notify.call_count, 2)
+        self.assertFalse(notify.call_args.kwargs["down"])
+
+    def test_probe_never_raises_on_socket_error(self) -> None:
+        probe = self._make()
+        with mock.patch(
+            "socket.create_connection", side_effect=OSError("no route to host")
+        ):
+            ok, detail = probe.probe_once()
+        self.assertFalse(ok)
+        self.assertIn("no route to host", detail)
+
+
+class ProgressWatchdogTest(unittest.TestCase):
+    def _watchdog(self, hits: list) -> "ocr_daemon.ProgressWatchdog":
+        watchdog = ocr_daemon.ProgressWatchdog(
+            0.05, interval=0.01, notify_fn=lambda *args: hits.append(args) or True
+        )
+        return watchdog
+
+    def test_idle_between_batches_does_not_alert(self) -> None:
+        hits: list = []
+        watchdog = self._watchdog(hits)
+        watchdog.start()
+        time.sleep(0.2)
+        watchdog.stop()
+        self.assertEqual(hits, [], "没有批次在跑时不该误报")
+
+    def test_alerts_once_when_batch_stalls(self) -> None:
+        hits: list = []
+        watchdog = self._watchdog(hits)
+        watchdog.begin_batch("0918", None)
+        watchdog.start()
+        time.sleep(0.25)
+        watchdog.stop()
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0][0], "0918")
+
+    def test_progress_resets_the_timer(self) -> None:
+        hits: list = []
+        watchdog = self._watchdog(hits)
+        watchdog.begin_batch("0918", None)
+        watchdog.start()
+        for _ in range(8):
+            watchdog.beat("还在跑")
+            time.sleep(0.02)
+        watchdog.stop()
+        self.assertEqual(hits, [])
+
+    def test_end_batch_disarms(self) -> None:
+        hits: list = []
+        watchdog = self._watchdog(hits)
+        watchdog.begin_batch("0918", None)
+        watchdog.end_batch()
+        watchdog.start()
+        time.sleep(0.2)
+        watchdog.stop()
+        self.assertEqual(hits, [])
+
+
+class ArtifactAlertMailTest(unittest.TestCase):
+    """两类新报警的文案与级别。"""
+
+    def _capture(self, func, **kwargs) -> dict:
+        captured: dict = {}
+
+        def fake_notify(title, lines, *, severity="info", attachments=None, config=None):
+            captured["title"] = title
+            captured["severity"] = severity
+            captured["body"] = "\n".join(lines)
+            return True
+
+        with mock.patch.dict(os.environ, {"ALERT_MAIL_ENABLED": "0"}, clear=False):
+            with mock.patch.object(email_alert, "notify", side_effect=fake_notify):
+                func(**kwargs)
+        return captured
+
+    def test_missing_csv_mail_is_error_level(self) -> None:
+        captured = self._capture(
+            email_alert.notify_artifacts_missing,
+            batch_label="0918",
+            missing=["第 2/5 块（run r2）没有生成 result.csv"],
+            expected=5,
+        )
+        self.assertEqual(captured["severity"], "error")
+        self.assertIn("没有产出结果文件", captured["title"])
+        self.assertIn("第 2/5 块", captured["body"])
+
+    def test_empty_products_mail_is_warning_level(self) -> None:
+        captured = self._capture(
+            email_alert.notify_products_empty,
+            batch_label="0918",
+            empty_products=[{"product_id": "1002", "note": "核心字段全部为空"}],
+            total_products=500,
+        )
+        self.assertEqual(captured["severity"], "warning")
+        self.assertIn("完全没识别出来", captured["title"])
+        self.assertIn("1002", captured["body"])
+
+    def test_stuck_mail_is_error_level(self) -> None:
+        captured = self._capture(
+            email_alert.notify_stuck,
+            batch_label="0918",
+            stuck_minutes=30,
+            last_progress="100/500 OCR 完成",
+        )
+        self.assertEqual(captured["severity"], "error")
+        self.assertIn("30 分钟无进度", captured["title"])
+
+    def test_summary_escalates_when_csv_missing(self) -> None:
+        captured: dict = {}
+
+        def fake_notify(title, lines, *, severity="info", attachments=None, config=None):
+            captured["title"] = title
+            captured["severity"] = severity
+            captured["body"] = "\n".join(lines)
+            return True
+
+        with mock.patch.dict(os.environ, {"ALERT_MAIL_ENABLED": "0"}, clear=False):
+            with mock.patch.object(email_alert, "notify", side_effect=fake_notify):
+                email_alert.notify_pipeline_result(
+                    {
+                        "status": "complete",
+                        "success_count": 3,
+                        "review_count": 0,
+                        "product_count": 3,
+                        "csv_missing": ["第 1 块没有生成 result.csv"],
+                        "csv_rows": 0,
+                    },
+                    batch_label="0918",
+                )
+        self.assertEqual(captured["severity"], "error")
+        self.assertIn("没有产出结果文件", captured["title"])
+
+    def test_summary_escalates_when_products_are_empty(self) -> None:
+        captured: dict = {}
+
+        def fake_notify(title, lines, *, severity="info", attachments=None, config=None):
+            captured["title"] = title
+            captured["severity"] = severity
+            captured["body"] = "\n".join(lines)
+            return True
+
+        with mock.patch.dict(os.environ, {"ALERT_MAIL_ENABLED": "0"}, clear=False):
+            with mock.patch.object(email_alert, "notify", side_effect=fake_notify):
+                email_alert.notify_pipeline_result(
+                    {
+                        "status": "complete",
+                        "success_count": 3,
+                        "review_count": 0,
+                        "product_count": 3,
+                        "csv_rows": 3,
+                        "empty_products": [{"product_id": "1002", "note": "核心字段全部为空"}],
+                    },
+                    batch_label="0918",
+                )
+        self.assertEqual(captured["severity"], "warning")
+        self.assertIn("完全没识别出来", captured["title"])
+        self.assertIn("单独告警邮件", captured["body"])
+
+    def test_preview_renders_every_alert_without_sending(self) -> None:
+        import contextlib
+        import io
+
+        buffer = io.StringIO()
+        with mock.patch.dict(os.environ, {"ALERT_MAIL_ENABLED": "0"}, clear=False):
+            with contextlib.redirect_stdout(buffer):
+                code = email_alert.preview_all()
+        self.assertEqual(code, 0)
+        output = buffer.getvalue()
+        # 每一种触发点都要能渲染出来
+        for marker in (
+            "批次运行成功",
+            "没有产出结果文件",
+            "完全没识别出来",
+            "批次运行失败",
+            "后台服务已退出",
+            "批次疑似卡住",
+            "内网 OCR 服务不可达",
+            "内网 OCR 服务已恢复",
+        ):
+            self.assertIn(marker, output)
 
 
 if __name__ == "__main__":
