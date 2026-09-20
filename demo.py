@@ -2736,8 +2736,6 @@ def assemble_product(
     persona_error = ""
     if not extract_result.get("ok"):
         persona_error = str(extract_result.get("error", {}).get("message", "Qwen 提取失败"))
-    all_skus = product.get("all_skus")
-    sku_values = list(dict.fromkeys(str(value).strip() for value in all_skus if str(value).strip())) if isinstance(all_skus, list) else []
     available: dict[str, Any] = {
         "platform": product["platform"],
         "product_id": product["product_id"],
@@ -2779,9 +2777,6 @@ def assemble_product(
         "价格数据来源": db_price.get("platform_source", {}).get("label"),
         "价格月份": price_month,
         "价格新鲜度": price_freshness,
-        "所有SKU": "、".join(sku_values) if sku_values else None,
-        "SKU数量": len(sku_values) if sku_values else None,
-        "上架时间": product.get("first_shelf_time"),
         "persona_json": json.dumps(model, ensure_ascii=False) if model else None,
         "persona_error": persona_error or None,
     }

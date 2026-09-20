@@ -106,9 +106,6 @@
     { "name": "热门话题", "type": "string", "nullable": true, "sources": ["search.hot_topics"], "strategy": "direct" },
     { "name": "成分含量", "type": "string", "nullable": true, "sources": ["model.ingredient_content"], "strategy": "direct" },
     { "name": "适用人群", "type": "string", "nullable": true, "sources": ["model.applicable_crowd", "model.renqun"], "strategy": "first_non_empty" },
-    { "name": "所有SKU", "type": "string", "nullable": true, "sources": ["input.all_skus"], "strategy": "distinct_join" },
-    { "name": "SKU数量", "type": "integer", "nullable": true, "sources": ["derived.count(input.all_skus)"], "strategy": "derived" },
-    { "name": "上架时间", "type": "datetime", "nullable": true, "sources": ["input.first_shelf_time"], "strategy": "earliest" },
     { "name": "persona_json", "type": "string", "nullable": true, "sources": ["model.raw_json"], "strategy": "json_serialize" },
     { "name": "persona_error", "type": "string", "nullable": true, "sources": ["model.error"], "strategy": "direct" }
   ]
