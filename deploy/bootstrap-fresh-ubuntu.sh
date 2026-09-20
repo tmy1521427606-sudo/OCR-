@@ -4,7 +4,7 @@
 # 适用于「刚装好系统、还没装任何依赖」的 Ubuntu 22.04 / 24.04（含 minimized 精简版）。
 # 它只做三件事，做完把控制权交给 deploy/install-linux.sh：
 #   1. 装系统依赖：python3 / python3-venv / python3-pip / git / ca-certificates / curl；
-#   2. 连通性预检：内网 OCR、PostgreSQL、GitHub、DashScope、163 SMTP —— 只报告，不阻断；
+#   2. 连通性预检：内网 OCR、PostgreSQL、GitHub、PyPI、DashScope、163 SMTP —— 只报告，不阻断；
 #   3. 调用 install-linux.sh 建 venv、装 Python 依赖、建目录、写 env、注册 systemd。
 #
 # 【前置条件】minimized 精简版通常连 git 都没有，而本脚本在仓库里 —— 拉仓库又需要 git。
@@ -129,6 +129,7 @@ SMTP_PORT="$(env_value ALERT_SMTP_PORT "465")"
 check_tcp "$(url_host "$OCR_URL")" "$(url_port "$OCR_URL" 8870)" "内网 OCR   " || FAILED=1
 check_tcp "$DB_HOST" "$DB_PORT" "PostgreSQL " || FAILED=1
 check_tcp github.com 443 "GitHub     " || FAILED=1
+check_tcp pypi.org 443 "PyPI       " || FAILED=1
 check_tcp dashscope.aliyuncs.com 443 "DashScope  " || FAILED=1
 check_tcp "$SMTP_HOST" "$SMTP_PORT" "163 SMTP   " || FAILED=1
 
@@ -136,6 +137,7 @@ if [[ "$FAILED" == "1" ]]; then
     warn "上面有不可达的地址。安装可以继续，但跑批次前必须解决："
     warn "  · 内网 OCR / PostgreSQL 不通 → 检查是否同一网段、防火墙、或者这台机器需要跳板路由"
     warn "  · GitHub 不通 → 改用 scp 传代码，或在能上网的机器上打好 tar 包再传"
+    warn "  · PyPI 不通 → 装 Python 依赖会失败；若无外网，请配内网镜像源（PIP_INDEX_URL）"
     warn "  · DashScope / SMTP 不通 → 检查出网策略；SMTP 不通会导致收不到报警邮件"
 else
     ok "所有外部依赖都通"

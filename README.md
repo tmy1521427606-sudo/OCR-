@@ -172,6 +172,40 @@ for f in deploy/*.sh; do tr -d '\r' < "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done
 仓库里已有 `.gitattributes` 强制 `deploy/*.sh`、`*.service` 等走 LF，
 重新打包/克隆不会再出现这个问题。手工打包时请带上 `-c core.autocrlf=false`。
 
+**`ERROR: Cannot install psycopg[...] and psycopg-binary==3.2.0, ... because these package versions have conflicting dependencies`**
+
+pip 把所有候选版本都试了一遍还是没成，**这不是版本号写错了**，基本就是
+「当前平台（或镜像源）没有可用的 wheel」。最常见的两种：
+
+1. 机器是 **aarch64（ARM）**，而 pip 走的是内网镜像源，镜像里只同步了 x86_64 的 wheel；
+2. 镜像源同步不全 / 版本太旧。
+
+先看真实原因 —— **不要加 `--quiet`，它会把「The conflict is caused by:」整段原因一起吞掉**：
+
+```bash
+/opt/ocr-v7/.venv/bin/pip install 'psycopg[binary]>=3.2,<4' 2>&1 | tail -40
+uname -m                                        # 看架构
+/opt/ocr-v7/.venv/bin/pip config list           # 看用的是哪个源
+```
+
+三种解法，从快到慢：
+
+```bash
+# ① 换官方源试一次（镜像源缺 wheel 时最有效）
+/opt/ocr-v7/.venv/bin/pip install -i https://pypi.org/simple 'psycopg[binary]>=3.2,<4'
+
+# ② 退回纯 Python 版 psycopg + 系统 libpq5（功能一致，性能略低）
+sudo apt-get install -y libpq5
+/opt/ocr-v7/.venv/bin/pip install 'psycopg>=3.2,<4'
+
+# ③ 确认真的能导入再往下走
+/opt/ocr-v7/.venv/bin/python -c "from psycopg import pq; print(pq.__impl__, pq.version())"
+```
+
+`install-linux.sh` 现在会自动做 ②（`psycopg[binary]` 装不上就自动退回纯 Python 版），
+并且在装依赖前先打印架构 / platform / pip 版本 —— 一旦失败，那几行基本就是答案。
+依赖装完还会做一次导入校验（含 libpq 版本），校验不过直接停下来，不会带着坏环境继续。
+
 ### 手动运行
 
 ```bash

@@ -3,9 +3,13 @@
 #
 # 做四件事：
 #   1. 建 venv 并装依赖（psycopg / openpyxl / Pillow，都不需要编译）；
+#      psycopg[binary] 装不上时自动退回纯 Python 版 + 系统 libpq5；
 #   2. 建好收件目录、状态目录、输出目录；
 #   3. 生成 /etc/ocr-v7/ocr-daemon.env（已存在则不动，避免覆盖密钥）；
 #   4. 注册并启动 systemd 服务。
+#
+# 依赖安装刻意不用 --quiet：装失败时 pip 打印的「The conflict is caused by:」
+# 才是真正的原因，加 --quiet 会把它一起吞掉，只剩一句没头没尾的 ERROR。
 #
 # 用法（在仓库根目录，用 root 或有 sudo 的账号跑）：
 #   sudo bash deploy/install-linux.sh
@@ -63,9 +67,55 @@ log "创建 Python 虚拟环境：$APP_DIR/.venv"
 if [[ ! -x "$APP_DIR/.venv/bin/python" ]]; then
     "$PYTHON_BIN" -m venv "$APP_DIR/.venv"
 fi
-"$APP_DIR/.venv/bin/python" -m pip install --upgrade pip >/dev/null
-log "安装依赖（psycopg / openpyxl / Pillow）"
-"$APP_DIR/.venv/bin/pip" install --quiet 'psycopg[binary]>=3.2,<4' 'openpyxl>=3.1,<4' 'Pillow>=10,<13'
+
+VENV_PY="$APP_DIR/.venv/bin/python"
+
+# 先把自己是谁打出来。装依赖失败时，这几行往往就是答案
+# （典型：aarch64 + 只有 x86_64 wheel 的镜像源 → psycopg[binary] 解析不出候选版本）。
+log "环境信息"
+"$VENV_PY" - <<'PY'
+import platform, sys, sysconfig
+print(f"  python   : {sys.version.split()[0]} ({platform.machine()})")
+print(f"  platform : {sysconfig.get_platform()}")
+PY
+if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+    warn "检测到 PIP_INDEX_URL（走镜像源）：$(printf '%s' "$PIP_INDEX_URL" | sed -E 's#//[^@/]*@#//***@#')"
+    warn "镜像源缺 wheel 时会报「conflicting dependencies」，用官方源试一次往往就好了。"
+fi
+
+log "升级 pip"
+"$VENV_PY" -m pip install --upgrade pip
+"$APP_DIR/.venv/bin/pip" -V
+
+# 分开装：哪个包出问题一眼就能看出来，别让 --quiet 把原因一起吞掉。
+log "安装 openpyxl / Pillow"
+"$APP_DIR/.venv/bin/pip" install 'openpyxl>=3.1,<4' 'Pillow>=10,<13'
+
+log "安装 PostgreSQL 驱动 psycopg"
+# 优先预编译 wheel（自带 libpq，开箱即用）；某些平台/镜像源没有对应 wheel，
+# 这时退回纯 Python 实现 + 系统 libpq5，功能完全一样，只是解析稍慢。
+if ! "$APP_DIR/.venv/bin/pip" install 'psycopg[binary]>=3.2,<4'; then
+    warn "psycopg[binary] 装不上，多半是当前平台没有对应的预编译 wheel。"
+    warn "退回纯 Python 版 psycopg + 系统 libpq5（功能一致，性能略低）。"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq || warn "apt-get update 失败，继续尝试"
+        apt-get install -y libpq5 || warn "libpq5 安装失败，继续尝试"
+    fi
+    "$APP_DIR/.venv/bin/pip" install 'psycopg>=3.2,<4' \
+        || die "psycopg 装不上。请检查这台机器到 PyPI（或镜像源）的网络，以及 uname -m 是否被镜像源支持。"
+fi
+
+log "校验依赖可导入"
+"$VENV_PY" - <<'PY' || die "依赖校验失败，上面的报错就是原因。"
+import openpyxl
+import PIL
+from psycopg import pq
+print(f"  openpyxl {openpyxl.__version__} / Pillow {PIL.__version__}")
+try:
+    print(f"  psycopg 后端={pq.__impl__} libpq={pq.version()}")
+except Exception as exc:  # libpq 缺失时这里会炸，必须让脚本停下来
+    raise SystemExit(f"psycopg 已安装但无法加载 libpq：{exc}")
+PY
 
 log "创建数据目录"
 mkdir -p "$INPUT_ROOT" /var/lib/ocr-v7/state /var/lib/ocr-v7/runs /etc/ocr-v7
