@@ -38,7 +38,9 @@
 #
 # 其它开关：
 #   --prefix NAME        批次名前缀，默认 batch
-#   --start N            起始批次号，默认 1（撞名时用它往上跳，别覆盖旧批次）
+#   --start N            起始批次号。不给时自动看收件目录里已有的最大批次号 +1，
+#                        适合「商品分几个容器目录陆续到、每到一个跑一次本脚本」
+#                        的场景（不用人记上次编到几号）；显式给了就以给的为准
 #   --force              守护进程正在跑也照拆（它可能读到半个批次，慎用）
 #   --include-no-image   连「目录里没有图」的一级目录也拆进去（默认跳过，它们不可能是商品）
 #   --allow-container    确实要把容器目录当成一个商品时用（默认会拦下来）
@@ -50,7 +52,8 @@ SRC=""
 INBOX="/data/ocr/inbox"
 SIZE=500
 PREFIX="batch"
-START=1
+START=""
+START_GIVEN=0
 DRY_RUN=0
 FORCE=0
 INCLUDE_NO_IMAGE=0
@@ -69,7 +72,7 @@ while [[ $# -gt 0 ]]; do
         --inbox)   INBOX="${2:-}";   shift 2 ;;
         --size)    SIZE="${2:-}";    shift 2 ;;
         --prefix)  PREFIX="${2:-}";  shift 2 ;;
-        --start)   START="${2:-}";   shift 2 ;;
+        --start)   START="${2:-}";   START_GIVEN=1; shift 2 ;;
         --dry-run) DRY_RUN=1;        shift ;;
         --force)   FORCE=1;          shift ;;
         --include-no-image) INCLUDE_NO_IMAGE=1; shift ;;
@@ -81,12 +84,31 @@ done
 
 [[ -n "$SRC" ]] || { usage; exit 2; }
 [[ "$SIZE"  =~ ^[1-9][0-9]*$ ]] || die "--size 必须是正整数，当前是 '$SIZE'"
-[[ "$START" =~ ^[1-9][0-9]*$ ]] || die "--start 必须是正整数，当前是 '$START'"
+[[ "$START_GIVEN" != "1" || "$START" =~ ^[1-9][0-9]*$ ]] \
+    || die "--start 必须是正整数，当前是 '$START'"
 [[ -d "$SRC" ]]   || die "找不到源目录：$SRC"
 [[ -d "$INBOX" ]] || die "找不到收件目录：$INBOX"
 
 SRC="$(cd "$SRC" && pwd -P)"
 INBOX="$(cd "$INBOX" && pwd -P)"
+
+# 没显式给 --start 时，自动取收件目录里已有批次的最大编号 +1。
+# 商品往往分几个容器目录陆续上传（jd_image / jd_image_part1 / 以后的新货），
+# 每到一个容器就跑一遍本脚本，批次号自动往后续，不用人记上次编到几号。
+AUTO_START=0
+if [[ "$START_GIVEN" != "1" ]]; then
+    max_existing=0
+    for d in "$INBOX"/*; do
+        [[ -d "$d" ]] || continue
+        base="$(basename "$d")"
+        if [[ "$base" =~ ^${PREFIX}-([0-9]+)$ ]]; then
+            n=$((10#${BASH_REMATCH[1]}))
+            (( n > max_existing )) && max_existing=$n
+        fi
+    done
+    START=$((max_existing + 1))
+    AUTO_START=1
+fi
 
 # 守护进程正在跑的时候搬目录，会让它读到半个批次。除非明确 --force，否则停下。
 if [[ "$FORCE" != "1" ]] && command -v systemctl >/dev/null 2>&1; then
@@ -172,7 +194,11 @@ echo "一级子目录    : $TOTAL 个"
 echo "其中含图片    : $((TOTAL - NO_IMAGE)) 个"
 echo "本次要拆      : $COUNT 个"
 echo "每批商品数    : $SIZE"
-echo "起始批次号    : $START"
+if [[ "$AUTO_START" == "1" ]]; then
+    echo "起始批次号    : $START（按收件目录里已有批次自动续号，可用 --start 覆盖）"
+else
+    echo "起始批次号    : $START"
+fi
 
 if [[ "$TOTAL" -eq 0 ]]; then
     echo
