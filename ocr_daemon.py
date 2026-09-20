@@ -115,6 +115,12 @@ CORE_METRIC_FIELDS = (
 #: CSV 里这些取值等同于「空」。导出时 list/dict 会被 json.dumps 成 "[]" / "{}"。
 _BLANK_TOKENS = {"", "[]", "{}", "null", "none"}
 
+#: 批次指纹算法。
+#: ``metadata`` = 「相对路径 + 文件大小 + mtime_ns」，只 stat，不读文件内容；
+#: ``content``  = 逐字节 sha256，最严格，但要把整个批次目录完整读一遍。
+FINGERPRINT_METADATA = "metadata"
+FINGERPRINT_CONTENT = "content"
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
@@ -700,6 +706,45 @@ def plan_chunks(products: list[Path], chunk_size: int) -> list[list[Path]]:
     return [products[index:index + size] for index in range(0, len(products), size)]
 
 
+def batch_fingerprint(
+    products: Sequence[Path], mode: str = FINGERPRINT_METADATA
+) -> str:
+    """算出一个批次的清单指纹，用来判断「同一批次要不要重跑」。
+
+    **默认的 metadata 模式只 stat，不读文件内容。** 这点在大批量下是决定性的：
+    一万个商品、几个 G 的图片，如果用 content 模式，每轮扫描（默认 60 秒一次）
+    都要把这几 G 完整读一遍，磁盘直接跑满。metadata 模式只做 200k 次 stat，
+    通常 1~3 秒就能跑完，代价是「路径/大小/mtime 完全相同的不同文件」
+    会被当成没变化 —— 对本场景（上传一次就不再改）足够。
+    """
+    payload: list[dict[str, Any]] = []
+    if mode == FINGERPRINT_CONTENT:
+        for path in products:
+            payload.append(
+                {
+                    "product_id": demo.canonical_id(path.name),
+                    "images": [
+                        (image.relative_to(path).as_posix(), demo.file_sha256(image))
+                        for image in demo.find_images(path)
+                    ],
+                }
+            )
+        return demo.stable_hash(payload)
+
+    for path in products:
+        entries: list[tuple[str, int, int]] = []
+        for image in demo.find_images(path):
+            try:
+                stat = image.stat()
+            except OSError:
+                continue
+            entries.append(
+                (image.relative_to(path).as_posix(), stat.st_size, stat.st_mtime_ns)
+            )
+        payload.append({"product_id": demo.canonical_id(path.name), "images": entries})
+    return demo.stable_hash(payload)
+
+
 # --------------------------------------------------------------------------- #
 # 单个批次执行
 # --------------------------------------------------------------------------- #
@@ -718,6 +763,7 @@ class RunOptions:
     max_attempts: int
     retry_review: bool
     mail: email_alert.MailConfig = field(default_factory=email_alert.mail_config)
+    fingerprint: str = FINGERPRINT_METADATA
 
 
 def preflight_env(mail: email_alert.MailConfig) -> list[str]:
@@ -771,14 +817,19 @@ def run_one_batch(
     options: RunOptions,
     *,
     config: dict[str, Any] | None,
+    products: list[Path] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """跑完一个批次目录（内部按 chunk 分批调用管线）。
+
+    :param products: 已经扫描好的商品目录列表。``process_cycle`` 扫过一次了，
+        这里直接复用，避免一万个商品的大批次被重复遍历整棵树。
 
     返回 ``(汇总结果, 可复用的管线配置)``。
     """
     batch_key = batch_dir.name
     batch_output_root = options.output_root / batch_key
-    products = demo.product_candidates(batch_dir)
+    if products is None:
+        products = demo.product_candidates(batch_dir)
     if not products:
         raise demo.DemoError("NO_PRODUCTS", f"批次 {batch_key} 下没有商品目录")
 
@@ -933,19 +984,18 @@ def process_cycle(
         batch_key = batch_dir.name
         record = ledger.get(batch_key, batch_dir)
         try:
+            scan_started = time.perf_counter()
             products = demo.product_candidates(batch_dir)
-            manifest_hash = demo.stable_hash(
-                [
-                    {
-                        "product_id": demo.canonical_id(path.name),
-                        "images": [
-                            (image.relative_to(path).as_posix(), demo.file_sha256(image))
-                            for image in demo.find_images(path)
-                        ],
-                    }
-                    for path in products
-                ]
-            )
+            manifest_hash = batch_fingerprint(products, options.fingerprint)
+            scan_seconds = time.perf_counter() - scan_started
+            if scan_seconds > 5:
+                LOGGER.warning(
+                    "批次 %s 扫描耗时 %.1f 秒（%d 个商品，指纹模式=%s）",
+                    batch_key,
+                    scan_seconds,
+                    len(products),
+                    options.fingerprint,
+                )
         except (OSError, demo.DemoError) as exc:
             LOGGER.warning("批次 %s 扫描失败：%s", batch_key, exc)
             record.status = "failed"
@@ -975,7 +1025,7 @@ def process_cycle(
             watchdog.begin_batch(batch_key, options.output_root / batch_key)
         try:
             result, config_holder["config"] = run_one_batch(
-                batch_dir, options, config=config_holder.get("config")
+                batch_dir, options, config=config_holder.get("config"), products=products
             )
         except KeyboardInterrupt:
             if watchdog is not None:
@@ -1129,6 +1179,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=f"每个批次块最多几个商品（上限 {MAX_CHUNK_SIZE}），默认 {DEFAULT_CHUNK_SIZE}",
     )
     parser.add_argument(
+        "--fingerprint",
+        choices=(FINGERPRINT_METADATA, FINGERPRINT_CONTENT),
+        default=os.environ.get("OCR_FINGERPRINT", FINGERPRINT_METADATA).strip().lower()
+        or FINGERPRINT_METADATA,
+        help=(
+            "批次变更判定方式：metadata（默认，只 stat，适合大批量）"
+            "或 content（逐字节 sha256，慢但最严格）"
+        ),
+    )
+    parser.add_argument(
         "--stuck-minutes",
         type=float,
         default=_env_float("OCR_STUCK_MINUTES", 30.0),
@@ -1215,6 +1275,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOGGER.info("OCR 停机窗口：未配置（探活失败就会告警）")
     if watchdog is not None:
         LOGGER.info("卡住看门狗：连续 %.0f 分钟没有进度输出则告警一次", args.stuck_minutes)
+    LOGGER.info(
+        "批次变更判定：%s（%s）",
+        args.fingerprint,
+        "只比对路径/大小/mtime，不读文件内容"
+        if args.fingerprint == FINGERPRINT_METADATA
+        else "逐字节 sha256，慢但最严格",
+    )
     if args.dry_run:
         # dry-run 不碰任何外部服务，也不该因为缺密钥就报错，更不该发告警邮件。
         LOGGER.info("dry-run 模式：跳过凭据与服务预检")
@@ -1235,6 +1302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_attempts=args.max_attempts,
         retry_review=not args.no_retry_review,
         mail=mail,
+        fingerprint=args.fingerprint,
     )
 
     # 非交互确认：服务账号没有 tty，任何 input() 都会卡死服务。
@@ -1324,6 +1392,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"输出目录：{output_root}",
                 f"轮询模式：{'单轮' if args.once else f'每 {args.interval} 秒'}",
                 f"单块商品数上限：{min(options.chunk_size, MAX_CHUNK_SIZE)}",
+                f"批次变更判定：{args.fingerprint}",
                 f"卡住告警：{'关闭' if watchdog is None else f'{args.stuck_minutes:.0f} 分钟无进度'}",
                 f"OCR 探活：{'关闭' if probe is None else f'{probe.host}:{probe.port} 每 {int(probe_interval)} 秒'}",
                 f"OCR 停机窗口：{_describe_windows(maintenance) or '未配置'}",

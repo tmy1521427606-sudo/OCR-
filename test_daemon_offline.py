@@ -911,5 +911,75 @@ class ArtifactAlertMailTest(unittest.TestCase):
             self.assertIn(marker, output)
 
 
+class BatchFingerprintTest(unittest.TestCase):
+    """一万个商品 + 几个 G 图片的场景下，指纹不能每轮都把文件读一遍。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        make_batch(self.root, "0918", {"1001": 2, "1002": 2})
+        self.products = demo.product_candidates(self.root / "0918")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_metadata_mode_never_reads_file_content(self) -> None:
+        with mock.patch.object(
+            demo, "file_sha256", side_effect=AssertionError("metadata 模式不应该读文件内容")
+        ):
+            first = ocr_daemon.batch_fingerprint(self.products)
+            second = ocr_daemon.batch_fingerprint(self.products)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 64)
+
+    def test_metadata_fingerprint_changes_when_file_changes(self) -> None:
+        before = ocr_daemon.batch_fingerprint(self.products)
+        write_image(self.root / "0918" / "1001" / "03.jpg", (1, 2, 3))
+        after = ocr_daemon.batch_fingerprint(demo.product_candidates(self.root / "0918"))
+        self.assertNotEqual(before, after)
+
+    def test_content_mode_uses_file_hash(self) -> None:
+        with mock.patch.object(demo, "file_sha256", return_value="deadbeef") as hasher:
+            ocr_daemon.batch_fingerprint(self.products, ocr_daemon.FINGERPRINT_CONTENT)
+        self.assertEqual(hasher.call_count, 4, "2 个商品各 2 张图，应逐个算哈希")
+
+    def test_modes_produce_different_fingerprints(self) -> None:
+        metadata = ocr_daemon.batch_fingerprint(self.products, ocr_daemon.FINGERPRINT_METADATA)
+        content = ocr_daemon.batch_fingerprint(self.products, ocr_daemon.FINGERPRINT_CONTENT)
+        self.assertNotEqual(metadata, content)
+
+
+class RunOneBatchReuseTest(unittest.TestCase):
+    def test_scanned_products_are_reused(self) -> None:
+        """process_cycle 已经扫过一次，run_one_batch 不该再遍历整棵树。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = make_batch(root / "inbox", "0918", {"1001": 1})
+            options = ocr_daemon.RunOptions(
+                input_root=root / "inbox",
+                platform="jd",
+                template_path=root / "template-v2.json",
+                state_dir=root / "state",
+                output_root=root / "runs",
+                ocr_workers=1,
+                bulk_first_pass=True,
+                chunk_size=100,
+                dry_run=True,
+                retryable_backoff=0,
+                max_attempts=3,
+                retry_review=True,
+                mail=disabled_mail(),
+            )
+            products = demo.product_candidates(batch)
+            with mock.patch.object(
+                demo, "product_candidates", side_effect=AssertionError("不该重复扫描")
+            ):
+                result, _ = ocr_daemon.run_one_batch(
+                    batch, options, config=None, products=products
+                )
+        self.assertEqual(result["status"], "dry-run")
+        self.assertEqual(result["product_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
