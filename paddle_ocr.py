@@ -39,6 +39,10 @@ def verify_paddle_available(api_url: str, timeout: float = 3.0) -> None:
 def build_payload(images: list[PaddleImage]) -> dict[str, list[dict[str, str]]]:
     if not 1 <= len(images) <= PADDLE_BATCH_SIZE:
         raise PaddleOcrError(f"Paddle batch must contain 1 to {PADDLE_BATCH_SIZE} images")
+    ids = [image.request_id for image in images]
+    if len(set(ids)) != len(ids):
+        # 服务端遇到重复 id 会整批返回 422，在本地就拦下来，报错信息才有指向性。
+        raise PaddleOcrError("Paddle batch contains duplicate request ids")
     return {"images": [
         {"id": image.request_id, "image_base64": base64.b64encode(image.path.read_bytes()).decode("ascii")}
         for image in images

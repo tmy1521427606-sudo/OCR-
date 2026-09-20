@@ -1242,7 +1242,20 @@ def vllm_ocr_payload(image_path: Path, model: str) -> dict[str, Any]:
 
 
 def paddle_request_id(product: dict[str, Any], image: dict[str, Any]) -> str:
-    return f"{product['platform']}/{product['product_id']}/{image['sha256']}"
+    """单次 OCR 请求的唯一标识。
+
+    这里刻意**不能**只用 ``image['sha256']``：同一个商品目录里完全可能有两张
+    字节一致的图片（例如 20.jpg 和 26.jpg 是同一张素材），那样两张图会拿到
+    同一个 request_id，进而引发两个后果：
+
+    1. 同一个批次里出现重复 id，PaddleOCR 服务端直接以 HTTP 422 拒收整批，
+       同批其余 7 张本来正常的图片一起被判为待复核；
+    2. ``product_by_request`` 以 request_id 为键，后写入的那张图会覆盖前一张，
+       导致前一张的图片名被替换掉（20.jpg 从结果里消失、26.jpg 出现两次）。
+
+    图片的 ``name`` 在商品目录内唯一（相对路径 + 自然排序），因此用它来区分。
+    """
+    return f"{product['platform']}/{product['product_id']}/{image['name']}"
 
 
 def paddle_ocr_cache_key(image_sha256: str, model_version: str) -> str:
@@ -1419,40 +1432,67 @@ def run_paddle_ocr_stage(
             if not wait_for_paddle_recovery(run_id, config, store, exc):
                 raise_paddle_manual_resume_required()
 
-    def run_batch(batch: list[PaddleImage]) -> tuple[list[PaddleImage], list[dict[str, Any]], int, int, str | None]:
+    def post(url: str, images: list[PaddleImage]) -> list[dict[str, Any]]:
+        increment_metric(config, "ocr_api_calls")
+        with meter:
+            return post_batch(url, images, timeout=30)
+
+    def run_batch(
+        batch: list[PaddleImage],
+    ) -> tuple[list[PaddleImage], list[dict[str, Any]], int, int, dict[str, str]]:
+        """请求一个批次。
+
+        返回 ``(批次, 成功响应, 耗时ms, 尝试次数, 逐图错误映射)``。
+        只有整批成功时错误映射才为空；批次失败时会退化成逐图请求，
+        所以映射里只剩真正失败的那几张。
+        """
+        api_url = str(config["paddle_ocr_api_url"])
         started = time.perf_counter()
         error: str | None = None
-        results: list[dict[str, Any]] = []
         attempts = 0
         while True:
             last_error: PaddleOcrError | None = None
             for _ in range(2):
                 attempts += 1
                 try:
-                    increment_metric(config, "ocr_api_calls")
-                    with meter:
-                        results = post_batch(str(config["paddle_ocr_api_url"]), batch, timeout=30)
-                    return batch, results, round((time.perf_counter() - started) * 1000), attempts, None
+                    results = post(api_url, batch)
+                    return batch, results, round((time.perf_counter() - started) * 1000), attempts, {}
                 except PaddleOcrError as exc:
                     last_error = exc
                     error = safe_message(exc)
             if last_error is None or not is_paddle_service_interruption(last_error):
-                return batch, results, round((time.perf_counter() - started) * 1000), attempts, error
+                break
             if not wait_for_paddle_recovery(run_id, config, store, last_error):
                 raise_paddle_manual_resume_required()
 
+        # 整批被拒时不再把同批所有图片一起判死：逐张重试，能救几张救几张。
+        # 之前的行为是整批共用一个错误串，一张畸形图会带走另外 7 张正常图片。
+        errors = {image.request_id: error or "Paddle OCR 请求失败" for image in batch}
+        recovered: list[dict[str, Any]] = []
+        if len(batch) > 1 and (last_error is None or not is_paddle_service_interruption(last_error)):
+            progress(f"Paddle OCR 批次失败（{error}），改为逐张重试 {len(batch)} 张图片")
+            for image in batch:
+                try:
+                    single = post(api_url, [image])
+                except PaddleOcrError as exc:
+                    errors[image.request_id] = safe_message(exc)
+                    continue
+                recovered.extend(single)
+                errors.pop(image.request_id, None)
+        return batch, recovered, round((time.perf_counter() - started) * 1000), attempts, errors
+
     completed = sum(len(items) for items in output.values())
     with futures.ThreadPoolExecutor(max_workers=paddle_worker_count(config), thread_name_prefix="paddle") as executor:
-        for batch, results, duration_ms, attempts, error in executor.map(run_batch, batches):
+        for batch, results, duration_ms, attempts, error_map in executor.map(run_batch, batches):
             result_by_id = {str(item.get("id")): item for item in results}
             for requested in batch:
                 product, image, cache_key = product_by_request[requested.request_id]
                 key = identity_key(product["platform"], product["product_id"])
-                if error:
+                if requested.request_id in error_map:
                     item = paddle_result_to_ocr_result(image, {}, duration_ms=duration_ms, attempts=attempts)
                     item["error"] = {
                         "code": "PADDLE_OCR_REVIEW",
-                        "message": error,
+                        "message": error_map[requested.request_id],
                     }
                 else:
                     item = paddle_result_to_ocr_result(image, result_by_id[requested.request_id], duration_ms=duration_ms, attempts=attempts)
