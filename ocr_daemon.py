@@ -706,6 +706,40 @@ def plan_chunks(products: list[Path], chunk_size: int) -> list[list[Path]]:
     return [products[index:index + size] for index in range(0, len(products), size)]
 
 
+def batch_settled(
+    batch_dir: Path, products: Sequence[Path], settle_seconds: float
+) -> tuple[bool, str]:
+    """判断一个批次目录是不是「已经传完了」，返回 (是否稳定, 原因)。
+
+    为什么需要这一步：Xftp / sftp / rsync 往收件目录里塞文件是渐进的。
+    如果 10 个商品传到第 3 个时守护进程刚好扫到这一轮，就会把「半批」当成
+    一个完整批次跑掉 —— 产出一个只有 3 个商品的 result.csv，还发一封
+    「批次成功」的邮件，人以为跑完了，剩下 7 个则要等清单变化才重跑。
+    所以上传期间必须让批次「静置」足够久才允许开跑。
+
+    判据用批次目录下所有文件里**最新的 mtime**：只要有任何文件在
+    settle_seconds 内被写过，就认为还在传。
+    """
+    if settle_seconds <= 0:
+        return True, "未启用静置检查"
+    newest = 0.0
+    try:
+        for product in products:
+            for image in demo.find_images(product):
+                try:
+                    newest = max(newest, image.stat().st_mtime)
+                except OSError:
+                    continue
+    except OSError as exc:
+        return False, f"读取 mtime 失败: {exc}"
+    if newest <= 0:
+        return True, "批次内暂无可读文件"
+    age = time.time() - newest
+    if age < settle_seconds:
+        return False, f"最新文件 {age:.0f} 秒前还在写入（阈值 {settle_seconds:.0f} 秒）"
+    return True, f"已静置 {age:.0f} 秒"
+
+
 def batch_fingerprint(
     products: Sequence[Path], mode: str = FINGERPRINT_METADATA
 ) -> str:
@@ -764,6 +798,7 @@ class RunOptions:
     retry_review: bool
     mail: email_alert.MailConfig = field(default_factory=email_alert.mail_config)
     fingerprint: str = FINGERPRINT_METADATA
+    settle_seconds: float = 300.0
 
 
 def preflight_env(mail: email_alert.MailConfig) -> list[str]:
@@ -1004,6 +1039,15 @@ def process_cycle(
             stats["failed"] += 1
             continue
 
+        # 上传还没结束就开跑 = 把「半批」当完整批处理，产物少一半还报成功。
+        settled, settle_reason = batch_settled(
+            batch_dir, products, options.settle_seconds
+        )
+        if not settled:
+            LOGGER.info("批次 %s 暂不开跑：%s", batch_key, settle_reason)
+            stats["skipped"] += 1
+            continue
+
         should_run, reason = ledger.should_run(
             record,
             manifest_hash,
@@ -1189,6 +1233,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=_env_float("OCR_SETTLE_SECONDS", 300.0),
+        help=(
+            "批次静置多少秒内还有文件被写入就跳过本轮，默认 300。"
+            "防止上传（Xftp/sftp/rsync）途中被当成完整批次跑掉；设为 0 关闭"
+        ),
+    )
+    parser.add_argument(
         "--stuck-minutes",
         type=float,
         default=_env_float("OCR_STUCK_MINUTES", 30.0),
@@ -1303,6 +1356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         retry_review=not args.no_retry_review,
         mail=mail,
         fingerprint=args.fingerprint,
+        settle_seconds=max(0.0, args.settle_seconds),
     )
 
     # 非交互确认：服务账号没有 tty，任何 input() 都会卡死服务。
@@ -1393,6 +1447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"轮询模式：{'单轮' if args.once else f'每 {args.interval} 秒'}",
                 f"单块商品数上限：{min(options.chunk_size, MAX_CHUNK_SIZE)}",
                 f"批次变更判定：{args.fingerprint}",
+                f"上传静置阈值：{'关闭' if options.settle_seconds <= 0 else f'{options.settle_seconds:.0f} 秒'}",
                 f"卡住告警：{'关闭' if watchdog is None else f'{args.stuck_minutes:.0f} 分钟无进度'}",
                 f"OCR 探活：{'关闭' if probe is None else f'{probe.host}:{probe.port} 每 {int(probe_interval)} 秒'}",
                 f"OCR 停机窗口：{_describe_windows(maintenance) or '未配置'}",
