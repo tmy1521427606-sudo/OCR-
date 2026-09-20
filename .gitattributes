@@ -1,0 +1,28 @@
+# 统一换行符策略（重要，别删）
+#
+# 背景：本仓库在 Windows 上开发，本机 git 配置是 core.autocrlf=true。
+# autocrlf 不只在 checkout 时生效 —— `git archive` 导出时同样会把 LF 转成 CRLF，
+# 于是打出来的 tar.gz 里 deploy/*.sh 全是 CRLF。传到 Ubuntu 上 bash 会报：
+#
+#     deploy/bootstrap-fresh-ubuntu.sh: line 24: $'\r': command not found
+#     : invalid option name
+#
+# 因此凡是 Linux 侧要执行的文本文件，一律强制 eol=lf。
+# eol=lf 优先级高于 core.autocrlf，能同时管住 checkout 和 archive 两条路径。
+#
+# 需要重新打包分发时，也可以用：
+#     git -c core.autocrlf=false archive --format=tar.gz -o out.tar.gz HEAD
+
+# --- Linux 侧执行的文件：必须 LF ---
+deploy/bootstrap-fresh-ubuntu.sh   text eol=lf
+deploy/install-linux.sh            text eol=lf
+deploy/ocr-v7-daemon.service       text eol=lf
+deploy/ocr-daemon.env.example      text eol=lf
+*.sh                               text eol=lf
+*.service                          text eol=lf
+
+# --- Windows 原生脚本：保持 CRLF ---
+# （cmd.exe 对纯 LF 的 .cmd 处理不严，goto/label 会出问题）
+*.cmd                              text eol=crlf
+*.bat                              text eol=crlf
+*.ps1                              text eol=crlf
