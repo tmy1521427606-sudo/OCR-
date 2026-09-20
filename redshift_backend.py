@@ -1006,7 +1006,13 @@ def _assemble_result(
     elif key_status == "missing":
         issues.append(_issue("KEY_NOT_FOUND", "未找到商品key"))
     if first.get("key_source_conflict"):
-        issues.append(_issue("KEY_SOURCE_CONFLICT", "主表与月度表商品key不同"))
+        issues.append(
+            _issue(
+                "KEY_SOURCE_CONFLICT",
+                "主表与月度表商品key不同（两套编号体系，已按主表key取值，不影响字段）",
+                "warning",
+            )
+        )
     if price_status == "ambiguous":
         issues.append(_issue("PRICE_AMBIGUOUS", "最新价格时点包含多个候选，未回退旧来源"))
     elif price_status == "missing":
@@ -1017,7 +1023,8 @@ def _assemble_result(
         issues.append(
             _issue(
                 "ATTRIBUTES_NOT_FOUND",
-                "数据库无属性，不代表 OCR 识别失败；主属性表和备用属性表均未返回记录",
+                "数据库无属性，不代表 OCR 识别失败；主属性表和备用属性表均未返回记录，字段回落到图片抽取",
+                "warning",
             )
         )
 

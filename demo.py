@@ -2660,7 +2660,8 @@ def assemble_product(
         problems.append(
             issue(
                 "DOSAGE_CONFLICT",
-                f"日服量存在多个相互独立的每日用量：{model.get('ri_fu_liang')}",
+                f"日服量存在多个相互独立的每日用量：{model.get('ri_fu_liang')}，日服量保留原文，最小/最大日服量已拆分",
+                "warning",
             )
         )
     if has_competitor_image_note(model.get("notes")):
@@ -2689,7 +2690,8 @@ def assemble_product(
         problems.append(
             issue(
                 "SPEC_TOTAL_CONFLICT",
-                f"确定性规格总量 {decimal_text(parsed_total)} 与模型总量 {decimal_text(model_total)} 不一致",
+                f"确定性规格总量 {decimal_text(parsed_total)} 与模型总量 {decimal_text(model_total)} 不一致，已采用确定性值",
+                "warning",
             )
         )
     total = parsed.get("total") if parsed_total is not None else model.get("guige_zong_liang")
@@ -4114,8 +4116,13 @@ def self_test() -> dict[str, Any]:
         },
         template,
     )
-    assert conflict_document["status"] == "review"
-    assert any(item["code"] == "SPEC_TOTAL_CONFLICT" for item in conflict_document["validation_issues"])
+    assert conflict_document["status"] == "success"
+    spec_conflict = next(
+        item for item in conflict_document["validation_issues"]
+        if item["code"] == "SPEC_TOTAL_CONFLICT"
+    )
+    assert spec_conflict["severity"] == "warning"
+    assert "已采用确定性值" in spec_conflict["message"]
     assert any(item["code"] == "SEARCH_EVIDENCE_MISSING" for item in conflict_document["validation_issues"])
     assert conflict_document["fields"]["代工厂"] is None
 
