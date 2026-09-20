@@ -79,6 +79,107 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 -Root "D:
 
 如果当前 PowerShell 不允许执行脚本，在以上命令前使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File`，或直接双击 CMD 启动器。
 
+## Linux 服务器后台运行（守护进程 + 邮件报警）
+
+Windows 上的 `直接用图片测试.py` 是 Tkinter 界面 + DPAPI 加密凭据，只能在桌面跑。Linux 服务器上没有 tty，因此这条链路改用 `ocr_daemon.py`：**完全非交互**，只靠环境变量配置，跑完按结果发邮件报警。
+
+### 目录约定
+
+```text
+/data/ocr/inbox/            ← 收件根目录（OCR_INPUT_ROOT）
+  2026-09-18/               ← 一个批次目录
+    100005996353\
+      01.jpg
+      02.jpg
+    100006731994\
+      01.jpg
+  2026-09-19/               ← 再来一个批次就被自动发现
+    ...
+```
+
+收件根目录下的**每个子目录**算一个批次。批次内商品数超过 100 时会自动切成多个批次块依次跑。
+
+### 一键部署
+
+```bash
+sudo bash deploy/install-linux.sh                      # 装依赖 + 建目录 + 注册 systemd
+sudo bash deploy/install-linux.sh --app-dir /opt/ocr-v7 --user ocr
+sudo bash deploy/install-linux.sh --no-service         # 只装依赖
+```
+
+脚本会在 `/etc/ocr-v7/ocr-daemon.env` 生成配置模板（已存在则不覆盖）。填好后：
+
+```bash
+sudo /opt/ocr-v7/.venv/bin/python /opt/ocr-v7/email_alert.py --self-test   # 先验证邮件链路
+sudo systemctl enable --now ocr-v7-daemon
+journalctl -u ocr-v7-daemon -f
+```
+
+### 手动运行
+
+```bash
+# 常驻：每 60 秒扫描一次收件目录
+.venv/bin/python ocr_daemon.py --input-root /data/ocr/inbox --platform jd
+
+# 只跑一轮就退出（适合挂 cron / systemd timer）
+.venv/bin/python ocr_daemon.py --input-root /data/ocr/inbox --platform jd --once
+
+# 只列出待处理批次，不真正运行（不需要密钥）
+.venv/bin/python ocr_daemon.py --input-root /data/ocr/inbox --platform jd --dry-run --once
+```
+
+常用参数：`--interval`（轮询间隔）、`--error-backoff`（服务中断后的退避秒数）、`--max-attempts`（单批次最大尝试次数）、`--no-retry-review`（待复核批次不自动重试）、`--chunk-size`（每块商品数上限）、`--ocr-workers`。
+
+### 邮件报警
+
+配置全部通过环境变量，模板见 `deploy/ocr-daemon.env.example`。默认收件人是 **13306032298@163.com**。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `ALERT_MAIL_ENABLED` | 配了账号密码即为 `1` | 总开关 |
+| `ALERT_SMTP_HOST` / `ALERT_SMTP_PORT` | `smtp.163.com` / `465` | SMTP 服务与端口 |
+| `ALERT_SMTP_SSL` | `1` | `1` 用 SMTP_SSL；`0` 用 STARTTLS |
+| `ALERT_SMTP_USER` | 空 | 登录账号（163 填完整邮箱） |
+| `ALERT_SMTP_PASSWORD` | 空 | **163 授权码，不是邮箱登录密码** |
+| `ALERT_MAIL_FROM` | 同 `ALERT_SMTP_USER` | 发件人 |
+| `ALERT_MAIL_TO` | `13306032298@163.com` | 收件人，多个用逗号分隔 |
+| `ALERT_ON_SUCCESS` | `1` | 运行成功时是否也发汇总邮件；设 `0` 只收告警 |
+| `ALERT_ATTACH_ARTIFACTS` | `1` | 附上 `performance.json` 和 `待复核图片.json`（单文件上限 2 MB） |
+
+会触发邮件的四类事件：
+
+| 主题标签 | 触发条件 |
+|---|---|
+| `【运行信息】` | 服务启动、邮件自检 |
+| `【运行成功】` | 批次全部商品 `success`（受 `ALERT_ON_SUCCESS` 控制） |
+| `【待复核】` | 批次状态为 `review`，邮件里列出待复核图片（最多 20 条） |
+| `【运行失败】` | 批次抛错，邮件带错误码、说明和排查建议；可重试的还会注明重试倒计时 |
+| `【严重故障】` | 启动时环境变量/安全项缺失 |
+
+邮件正文含商品成功/待复核数量、总耗时、OCR P50/P95、缓存命中数与输出目录。**报警是旁路：SMTP 连不上只写日志，不会影响 OCR 主管线。**
+
+### 批次台账与重试语义
+
+`.state/daemon/ledger.json` 按批次记录状态、清单指纹和尝试次数：
+
+- 上一次 `complete` 且图片清单指纹未变 → **跳过**；
+- 批次目录里新增/替换了图片（指纹变化）→ 自动重跑；
+- 上一次 `review` → 在下一次扫描时自动补齐（`--no-retry-review` 可关闭）；
+- 上一次 `failed` → 重试，直到 `--max-attempts` 上限后停止；
+- `PADDLE_OCR_INTERRUPTED` / `VLLM_NETWORK_OUTAGE` → 记为可重试，退避 `--error-backoff` 秒后继续，不会因为 OCR 服务抖一下就永久判死。
+
+因为底层仍是 demo.py 的 SQLite 状态库，**进程被 kill 之后再启动，已成功 OCR 的图片不会重复请求**（缓存命中会体现在邮件里）。
+
+### 优雅退出
+
+收到 `SIGTERM`/`SIGINT` 后先让当前批次跑完再退出，不会留下半截状态；再发一次信号则立即退出。systemd 单元里 `TimeoutStopSec=21600`，即最多等 6 小时。
+
+### 与 Windows 版的差异
+
+- `demo.py` 新增无人值守模式：`OCR_ASSUME_YES=1` 或 `--assume-yes`。打开后不再等待任何输入，缺少必填项直接报错退出。
+- 凭据只能走环境变量；守卫进程不会替你填 `OCR_DEMO_KEYS_ROTATED`，「确认泄露的阿里 Key 已轮换」这道闸门依然要求人工显式写 `YES`。
+- `直接用图片测试.py`、`run_demo.ps1`、`*.cmd`、DPAPI 加密凭据、`os.startfile` 打开报告这些只在 Windows 生效，后台服务不使用它们。
+
 ## 真实模式环境变量
 
 非密钥参数可以设置为当前 PowerShell 进程的环境变量；密钥变量不设置时，程序会用隐藏输入读取。不要创建 `.env`，也不要把值写进本目录文件。

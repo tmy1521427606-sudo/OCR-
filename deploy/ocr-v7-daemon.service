@@ -1,0 +1,69 @@
+# OCR v7 批次后台服务（systemd）
+#
+# 安装：
+#   sudo cp deploy/ocr-v7-daemon.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ocr-v7-daemon
+#
+# 常用命令：
+#   systemctl status ocr-v7-daemon
+#   journalctl -u ocr-v7-daemon -f
+#   sudo systemctl restart ocr-v7-daemon
+#   sudo systemctl stop ocr-v7-daemon
+#
+# 注意把下面 4 处的路径 / 用户改成你这台机器上的实际值。
+
+[Unit]
+Description=OCR v7 商品识别后台服务（PaddleOCR-VL + Qwen + PostgreSQL）
+Documentation=file:///opt/ocr-v7/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成实际的运行账号，建议用专用低权限账号，不要用 root。
+User=ocr
+Group=ocr
+WorkingDirectory=/opt/ocr-v7
+
+EnvironmentFile=/etc/ocr-v7/ocr-daemon.env
+# 后台服务绝不能读 stdin：确认逻辑全部走 OCR_ASSUME_YES。
+Environment=OCR_ASSUME_YES=1
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# 收件目录 / 平台 / 并发数都从上面的 EnvironmentFile 读取
+# （OCR_INPUT_ROOT、OCR_DEMO_PLATFORM、OCR_WORKERS），
+# 这里刻意不做 ${VAR} 展开，避免变量没定义时把参数吞掉导致启动失败。
+ExecStart=/opt/ocr-v7/.venv/bin/python /opt/ocr-v7/ocr_daemon.py \
+    --state-dir /var/lib/ocr-v7/state \
+    --output-root /var/lib/ocr-v7/runs \
+    --interval 60 \
+    --error-backoff 300 \
+    --max-attempts 3
+
+# 优雅退出：SIGTERM 后先让当前批次跑完（最长给 6 小时），再 SIGKILL。
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=21600
+
+Restart=always
+RestartSec=30
+
+# 资源与安全加固
+StateDirectory=ocr-v7
+StateDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/ocr-v7
+# 需要直接访问内网 IP，不要开启 IPAddressDeny 之类的强隔离。
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ocr-v7
+
+[Install]
+WantedBy=multi-user.target

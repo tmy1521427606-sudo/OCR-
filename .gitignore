@@ -32,3 +32,11 @@ performance.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Filled-in alert / daemon environment files (secrets). Only ship the template.
+*.env
+!*.env.example
+deploy/*.env
+.deploy/
+.split/
+

@@ -3692,9 +3692,30 @@ def create_mock_batch(root: Path, include_failure: bool = False) -> Path:
     return root
 
 
+def assume_yes() -> bool:
+    """是否处于无人值守模式（Linux 后台服务 / systemd）。
+
+    服务进程没有 tty，任何 ``input()`` / ``getpass()`` 都会让进程永久挂起，
+    所以后台运行时由 ``OCR_ASSUME_YES=1``（或命令行 ``--assume-yes``）打开：
+    交互确认一律跳过，缺少的必填项改为直接报错退出，而不是等待输入。
+    """
+    return os.environ.get("OCR_ASSUME_YES", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
 def required_text(env_name: str, label: str, *, secret: bool = False) -> str:
     value = os.environ.get(env_name, "").strip()
     if not value:
+        if assume_yes():
+            raise DemoError(
+                "CONFIG_REQUIRED",
+                f"缺少 {label}；无人值守模式不会等待输入，请通过环境变量 {env_name} 提供",
+            )
         value = (getpass.getpass(f"{label}: ") if secret else input(f"{label}: ")).strip()
     if not value:
         raise DemoError("CONFIG_REQUIRED", f"缺少 {label}")
@@ -3704,6 +3725,8 @@ def required_text(env_name: str, label: str, *, secret: bool = False) -> str:
 def optional_text(env_name: str, label: str, default: str = "") -> str:
     if env_name in os.environ:
         return os.environ[env_name].strip()
+    if assume_yes():
+        return default
     suffix = f" [{default}]" if default else "（可留空）"
     value = input(f"{label}{suffix}: ").strip()
     return value or default
@@ -3815,10 +3838,17 @@ def real_config(manifest: dict[str, Any]) -> dict[str, Any]:
         redshift_target=f"{host}:{port}/{database}",
         mock=False,
     )
-    if input("确认允许发送以上数据请输入 SEND: ").strip() != "SEND":
+    if assume_yes():
+        progress("[无人值守] 已自动确认数据外发清单（OCR_ASSUME_YES=1）")
+    elif input("确认允许发送以上数据请输入 SEND: ").strip() != "SEND":
         raise DemoError("CANCELLED", "用户取消外发")
     rotated = os.environ.get("OCR_DEMO_KEYS_ROTATED", "").strip().upper()
     if rotated not in {"YES", "ROTATED"}:
+        if assume_yes():
+            raise DemoError(
+                "KEY_ROTATION_REQUIRED",
+                "无人值守模式必须通过环境变量 OCR_DEMO_KEYS_ROTATED=YES 显式确认密钥已轮换",
+            )
         rotated = input("确认此前暴露的阿里密钥已吊销并轮换，请输入 ROTATED: ").strip().upper()
     if rotated != "ROTATED" and rotated != "YES":
         raise DemoError("KEY_ROTATION_REQUIRED", "未确认密钥轮换，禁止真实调用")
@@ -3879,6 +3909,11 @@ def prepare_manifest(args: argparse.Namespace, state_dir: Path) -> dict[str, Any
         selected = choose_products(root, None)
     platform = (args.platform or os.environ.get("OCR_DEMO_PLATFORM", "")).strip()
     if not platform:
+        if assume_yes():
+            raise DemoError(
+                "PLATFORM_REQUIRED",
+                "无人值守模式必须通过 --platform 或 OCR_DEMO_PLATFORM 指定数据库平台标识",
+            )
         suggested = root.parent.name
         entered = input(f"请输入数据库平台标识（建议值 {suggested!r}，回车确认）: ").strip()
         platform = entered or suggested
@@ -4348,11 +4383,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="批量首轮：跳过联网搜索，只输出 OCR、数据库结果和待补全字段",
     )
     parser.add_argument("--open", action="store_true", help="成功后打开报告和输出目录")
+    parser.add_argument(
+        "--assume-yes",
+        action="store_true",
+        help="无人值守：跳过所有交互确认（等价于环境变量 OCR_ASSUME_YES=1），供后台服务使用",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.assume_yes:
+        os.environ["OCR_ASSUME_YES"] = "1"
     if args.self_test:
         result = self_test()
         print("SELF_TEST_OK=" + json.dumps(result, ensure_ascii=False))
