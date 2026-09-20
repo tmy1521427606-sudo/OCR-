@@ -183,9 +183,17 @@ fi
 if [[ "$COUNT" -eq 0 ]]; then
     echo
     echo "！！ 一级子目录里一张图都没找到。"
-    echo "   说明图片还在更深一层，也就是说 $SRC 的第一层本身就已经是「商品组」，"
-    echo "   守护进程会把整个 $SRC 当成一个批次。"
-    echo "   如果这本就是你要的，直接把 $SRC 移进 $INBOX 就行，不用拆。"
+    if [[ "$SRC" == "$INBOX" ]]; then
+        echo "   收件目录目前只有 $TOTAL 个一级子目录且不含任何图片，通常是两种原因："
+        echo "   1. 上传工具（Xftp 等）还在传，图片文件还没到齐 —— 等传完再跑本脚本；"
+        echo "   2. 商品目录被包在一个容器目录里（如 inbox/jd_image/商品ID/图.jpg）"
+        echo "      —— 传完后用 ls $INBOX 确认名字，再执行："
+        echo "      sudo bash $0 --src $INBOX/<容器目录名> --inbox $INBOX --size $SIZE"
+    else
+        echo "   说明图片还在更深一层，也就是说 $SRC 的第一层本身就已经是「商品组」，"
+        echo "   守护进程会把整个 $SRC 当成一个批次。"
+        echo "   如果这本就是你要的，直接把 $SRC 移进 $INBOX 就行，不用拆。"
+    fi
     exit 1
 fi
 
