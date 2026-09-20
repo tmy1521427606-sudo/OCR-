@@ -7,6 +7,13 @@
 #   2. 连通性预检：内网 OCR、PostgreSQL、GitHub、DashScope、163 SMTP —— 只报告，不阻断；
 #   3. 调用 install-linux.sh 建 venv、装 Python 依赖、建目录、写 env、注册 systemd。
 #
+# 【前置条件】minimized 精简版通常连 git 都没有，而本脚本在仓库里 —— 拉仓库又需要 git。
+# 所以第一次上机时先手工补 git（顺带把 python 依赖一起装了，后面脚本会自动跳过已装的项）：
+#   sudo apt update
+#   sudo apt install -y git python3 python3-venv python3-pip ca-certificates curl
+# 之后 clone 仓库、切到目标分支，再跑本脚本。
+# 注意：`--check-only` 完全不碰系统依赖，克隆下来就能先跑，用来判断网络通不通。
+#
 # 用法（在仓库根目录执行，需要 root 或 sudo）：
 #   sudo bash deploy/bootstrap-fresh-ubuntu.sh
 #   sudo bash deploy/bootstrap-fresh-ubuntu.sh --app-dir /opt/ocr-v7 --user ubuntu

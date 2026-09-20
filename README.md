@@ -101,19 +101,31 @@ Windows 上的 `直接用图片测试.py` 是 Tkinter 界面 + DPAPI 加密凭�
 
 ### 一键部署
 
-**全新机器（还没装任何依赖，含 Ubuntu minimized 精简版）**：先用引导脚本，它会装
-`git/python3/python3-venv/python3-pip`、做连通性预检，再自动调用下面的 `install-linux.sh`。
+**全新机器（还没装任何依赖，含 Ubuntu minimized 精简版）**：
+
+minimized 精简版通常连 `git` 都没有，而引导脚本在仓库里、拉仓库又需要 `git`，
+所以第一次上机先手工补一下（Python 依赖一并装了，脚本之后会自动跳过已装项）：
 
 ```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-pip ca-certificates curl
+
+git clone https://github.com/tmy1521427606-sudo/OCR-.git
+cd OCR- && git checkout linux-daemon-email-alert
+```
+
+然后用引导脚本，它会做连通性预检再自动调用下面的 `install-linux.sh`：
+
+```bash
+sudo bash deploy/bootstrap-fresh-ubuntu.sh --check-only                 # 只做连通性预检，不碰系统
 sudo bash deploy/bootstrap-fresh-ubuntu.sh                             # 全新机器一步到位
-sudo bash deploy/bootstrap-fresh-ubuntu.sh --check-only                # 只做连通性预检
 sudo bash deploy/bootstrap-fresh-ubuntu.sh --app-dir /opt/ocr-v7 --user ubuntu
 ```
 
 预检会检查内网 OCR、PostgreSQL、GitHub、DashScope、163 SMTP 是否可达 —— 只报告不阻断，
 但这些不通的话批次跑不起来，建议先把网络搞清楚。
 
-已有 Python 环境的机器可以直接用：
+已有 Python 和 git 的机器可以直接用：
 
 ```bash
 sudo bash deploy/install-linux.sh                      # 装依赖 + 建目录 + 注册 systemd
