@@ -23,7 +23,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+UTC = timezone.utc  # Python 3.10 没有 datetime.UTC（3.11 才加入），别名兼容 3.10~3.13
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Callable

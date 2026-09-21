@@ -5,7 +5,9 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+
+UTC = timezone.utc  # Python 3.10 没有 datetime.UTC（3.11 才加入），别名兼容 3.10~3.13
 from pathlib import Path
 from typing import Any
 

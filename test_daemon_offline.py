@@ -404,6 +404,7 @@ class ProcessCycleTest(unittest.TestCase):
             chunk_size=100,
             dry_run=False,
             retryable_backoff=0,
+            settle_seconds=0,
             max_attempts=3,
             retry_review=True,
             mail=disabled_mail(),
